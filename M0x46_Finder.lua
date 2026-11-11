@@ -398,7 +398,7 @@ local function api(method, pathAndQuery, body)
     local ok, response, transportError = pcall(httpRequest, {
         Url = CONFIG.ENDPOINT .. pathAndQuery,
         Method = method,
-        Headers = { ["Content-Type"] = "application/json", ["X-M0x46-Room"] = CONFIG.ROOM_KEY },
+        Headers = { ["Content-Type"] = "application/json", ["X-Egg-Room"] = CONFIG.ROOM_KEY },
         Body = body and HttpService:JSONEncode(body) or nil,
         Timeout = 8,
     })
