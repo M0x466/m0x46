@@ -42,7 +42,7 @@
 --==============================================================================
 local CONFIG = {
     ENDPOINT = "https://m0x46-iqjlgk34.back4.app",   -- your backend, no trailing slash
-    ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI",                -- must equal ROOM_KEY on the server
+    ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI",                -- must equal ROOM_KEY on the server             
 
     HOTKEY = Enum.KeyCode.RightControl,
     SCAN_EVERY = 1,                       -- seconds between field scans
@@ -50,8 +50,11 @@ local CONFIG = {
     FEED_EVERY = 6,                       -- seconds between feed refreshes
     SIGHTING_TTL = 300,                   -- seconds a sighting stays live
 
-    MIN_RATE = 1e9,                       -- hide/ignore eggs below this /s
-    MIN_RANK = 6,                         -- mythic and up
+    -- NOTE: this game's field eggs are frequently in the 100M-900M/s range, so a
+    -- 1e9 floor hides almost everything. 1e8 keeps Mythic-and-up eggs visible;
+    -- raise it in SETTINGS once you know your server's numbers.
+    MIN_RATE = 1e8,                       -- hide/ignore eggs below this /s
+    MIN_RANK = 5,                         -- legendary and up (6 = mythic and up)
     CARD_LIMIT = 8,
     BROADCAST = true,                     -- upload sightings to your backend
     AUTO_JOIN = false,                    -- JOIN buttons do nothing unless true
@@ -398,7 +401,7 @@ local function api(method, pathAndQuery, body)
     local ok, response, transportError = pcall(httpRequest, {
         Url = CONFIG.ENDPOINT .. pathAndQuery,
         Method = method,
-        Headers = { ["Content-Type"] = "application/json", ["X-Egg-Room"] = CONFIG.ROOM_KEY },
+        Headers = { ["Content-Type"] = "application/json", ["X-M0x46-Room"] = CONFIG.ROOM_KEY },
         Body = body and HttpService:JSONEncode(body) or nil,
         Timeout = 8,
     })
@@ -429,6 +432,7 @@ end
 
 local function broadcast(entries)
     if not CONFIG.BROADCAST then return nil, "broadcast off" end
+    if not CAPS.network then return nil, "executor has no HTTP function" end
     if not game.JobId or game.JobId == "" then return nil, "no server id" end
     local payload = {}
     for _, entry in ipairs(entries) do
@@ -501,6 +505,12 @@ local STATE = {
     tab = "local",
     scanAge = 0,
 }
+
+-- Rarity label for a rank number (used by the filter message and the floor hint).
+local function rarityName(rank)
+    local spec = RARITY_BY_RANK[rank]
+    return spec and spec.name or "Any"
+end
 
 -- A short-lived message that outranks the per-scan status line, so clicking
 -- JOIN / changing a setting is still readable one second later.
@@ -735,7 +745,7 @@ local rateBox = make("TextBox", {
 make("UICorner", { CornerRadius = UDim.new(0, 8) }, rateBox)
 make("UIStroke", { Color = THEME.accent, Thickness = 1, Transparency = 0.45, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, rateBox)
 
-local rateHint = label(overlay, "Minimum income per second (1B – 50B)", UDim2.fromOffset(18, 214), UDim2.new(1, -36, 0, 16), THEME.muted, 11)
+local rateHint = label(overlay, "Minimum income per second (0 – 50B, 0 = all)", UDim2.fromOffset(18, 214), UDim2.new(1, -36, 0, 16), THEME.muted, 11)
 rateHint.ZIndex = 31
 
 local overlayInfo = label(overlay, "", UDim2.fromOffset(18, 250), UDim2.new(1, -36, 0, 90), THEME.muted, 11)
@@ -855,76 +865,131 @@ local function displayRank(entry)
     return raritySpec(entry).rank
 end
 
+-- The ONE place the min-rate / min-rarity filter lives. Scan loop, REFRESH and
+-- the tab switch all go through it, so they can never disagree about what counts.
+local function filterEntries(entries)
+    local kept = {}
+    for _, entry in ipairs(entries or {}) do
+        local rate = tonumber(entry.rate) or 0
+        if rate >= STATE.minRate and displayRank(entry) >= STATE.minRank then
+            kept[#kept + 1] = entry
+        end
+    end
+    table.sort(kept, function(a, b)
+        if (a.rate or 0) ~= (b.rate or 0) then return (a.rate or 0) > (b.rate or 0) end
+        return displayRank(a) > displayRank(b)
+    end)
+    return kept
+end
+
+
 local function weightText(entry)
     if validNumber(entry.weight) then return compact(entry.weight) .. " KG" end
     if validNumber(entry.scale) then return "×" .. compact(entry.scale) end
     return "—"
 end
 
+-- Card height adapts to the panel: 96 px (three rows of info) on a monitor,
+-- ~52 px (name + income + badge) on a phone or a small Delta window. Without
+-- this, two cards fill the list and the rest fall below the fold.
+local function cardHeight()
+    local height = panel.AbsoluteSize.Y
+    if not height or height <= 0 then return 96 end
+    if height >= 560 then return 96 end
+    if height >= 420 then return 76 end
+    return 52
+end
+
 local function makeCard(entry, index)
     local spec = raritySpec(entry)
+    local compact = cardHeight() < 96
+    local tall = cardHeight() >= 76
     local card = make("Frame", {
-        Name = "Card" .. index, Size = UDim2.new(1, -4, 0, 96), BackgroundColor3 = THEME.glass,
+        Name = "Card" .. index, Size = UDim2.new(1, -4, 0, cardHeight()), BackgroundColor3 = THEME.glass,
         BackgroundTransparency = 0.1, BorderSizePixel = 0, LayoutOrder = index, ZIndex = 5,
     })
     make("UICorner", { CornerRadius = UDim.new(0, 8) }, card)
     make("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(168, 158, 200)) }, card)
     make("UIStroke", { Color = Color3.fromRGB(110, 80, 185), Transparency = 0.3, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, card)
 
+    local height = cardHeight()
+    local chipY = tall and 34 or (height - 22)
+    local chipX = compact and 44 or 10
+    local stripY = tall and 58 or 4
+    local areaY = tall and 78 or 30
+
     -- rank + name
-    local rankLabel = label(card, "#" .. index, UDim2.fromOffset(10, 6), UDim2.fromOffset(34, 24), THEME.muted, 15)
+    local rankLabel = label(card, "#" .. index, UDim2.fromOffset(6, 5), UDim2.fromOffset(30, 22), THEME.muted,
+        compact and 13 or 15)
     rankLabel.Font = Enum.Font.GothamBlack
 
-    local nameLabel = label(card, tostring(entry.name), UDim2.fromOffset(48, 5), UDim2.new(1, -150, 0, 26), spec.color, 17)
+    local nameX = compact and 34 or 48
+    local nameLabel = label(card, tostring(entry.name), UDim2.fromOffset(nameX, 4),
+        UDim2.new(1, -(nameX + (tall and 150 or 108)), 0, 24), spec.color, tall and 17 or 15)
     nameLabel.Font = Enum.Font.GothamBlack
     make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1, Transparency = 0.5 }, nameLabel)
 
     -- rarity chip
+    local chipWidth = compact and 74 or 86
     local chip = make("TextLabel", {
-        Text = tostring(entry.rarity):upper(), Position = UDim2.fromOffset(10, 34), Size = UDim2.fromOffset(86, 18),
+        Text = tostring(entry.rarity):upper(), Position = UDim2.fromOffset(chipX, chipY),
+        Size = UDim2.fromOffset(chipWidth, 18),
         BackgroundColor3 = spec.color, BackgroundTransparency = 0.82, BorderSizePixel = 0,
-        Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = spec.color, ZIndex = 6,
+        Font = Enum.Font.GothamBold, TextSize = compact and 9 or 10, TextColor3 = spec.color, ZIndex = 6,
     }, card)
     make("UICorner", { CornerRadius = UDim.new(0, 4) }, chip)
     make("UIStroke", { Color = spec.color, Thickness = 1, Transparency = 0.55 }, chip)
 
-    -- income / weight
-    local income = label(card, money(entry.rate), UDim2.fromOffset(102, 34), UDim2.fromOffset(120, 20), THEME.green, 15)
+    -- income (+ weight when the card has room)
+    local incomeY = tall and 34 or (height - 24)
+    local income = label(card, money(entry.rate), UDim2.fromOffset(chipX + chipWidth + 6, incomeY),
+        UDim2.fromOffset(tall and 120 or 110, 20), THEME.green, compact and 14 or 15)
     income.Font = Enum.Font.GothamBlack
-    local weight = label(card, weightText(entry), UDim2.fromOffset(224, 34), UDim2.new(1, -320, 0, 20), THEME.muted, 12)
-    weight.TextXAlignment = Enum.TextXAlignment.Right
+    if tall then
+        local weight = label(card, weightText(entry), UDim2.fromOffset(224, 34), UDim2.new(1, -320, 0, 20), THEME.muted, 12)
+        weight.TextXAlignment = Enum.TextXAlignment.Right
+    end
 
     -- mutations
     local mutations = entry.mutations or {}
     local strip = make("Frame", {
-        Name = "Mutations", Position = UDim2.fromOffset(10, 58), Size = UDim2.new(1, -110, 0, 20), BackgroundTransparency = 1, ZIndex = 6,
+        Name = "Mutations", Position = UDim2.fromOffset(nameX, stripY),
+        Size = UDim2.new(1, -(nameX + (tall and 110 or 108)), 0, 18), BackgroundTransparency = 1, ZIndex = 6,
     }, card)
     make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, strip)
     if #mutations == 0 then
-        local none = label(strip, "no mutation", UDim2.new(), UDim2.fromOffset(90, 18), THEME.muted, 10)
-        none.Font = Enum.Font.Gotham
-        none.LayoutOrder = 1
+        if tall then
+            local none = label(strip, "no mutation", UDim2.new(), UDim2.fromOffset(90, 18), THEME.muted, 10)
+            none.Font = Enum.Font.Gotham
+            none.LayoutOrder = 1
+        end
     else
         for index_, mutation in ipairs(mutations) do
-            local word = label(strip, tostring(mutation), UDim2.new(), UDim2.fromOffset(#mutation * 8 + 10, 18), THEME.text, 11)
+            local word = label(strip, tostring(mutation), UDim2.new(),
+                UDim2.fromOffset(#mutation * (compact and 7 or 8) + 10, 18), THEME.text, compact and 10 or 11)
             word.Font = Enum.Font.GothamBlack
             word.LayoutOrder = index_
             paintMutation(word, mutation)
         end
     end
 
-    -- area line
-    if entry.area then
-        local areaLabel = label(card, "area " .. tostring(entry.area), UDim2.fromOffset(10, 78), UDim2.new(1, -120, 0, 14), THEME.muted, 10)
+    -- area line (only when the card has a third row)
+    if tall and entry.area then
+        local areaLabel = label(card, "area " .. tostring(entry.area), UDim2.fromOffset(10, areaY),
+            UDim2.new(1, -120, 0, 14), THEME.muted, 10)
         areaLabel.Font = Enum.Font.Gotham
     end
 
     -- join / status button
     local joinable = entry.jobId ~= nil and entry.jobId ~= game.JobId
-    local text = joinable and "JOIN" or "HERE"
+    local buttonWidth = compact and 62 or 86
+    local buttonHeight = compact and 26 or 30
     local button = styleButton(make("TextButton", {
-        Name = "JoinStatus", Text = text, Position = UDim2.new(1, -96, 0, 30), Size = UDim2.fromOffset(86, 30), ZIndex = 7,
+        Name = "JoinStatus", Text = joinable and "JOIN" or "HERE",
+        Position = UDim2.new(1, -(buttonWidth + 8), 0, math.floor((height - buttonHeight) / 2)),
+        Size = UDim2.fromOffset(buttonWidth, buttonHeight), ZIndex = 7,
     }, card), joinable)
+    button.TextSize = compact and 10 or 12
     button.BackgroundColor3 = joinable and Color3.fromRGB(40, 160, 85) or Color3.fromRGB(86, 90, 100)
     button.MouseButton1Click:Connect(function()
         if not joinable then return end
@@ -957,7 +1022,9 @@ local function render()
     if count == 0 then
         local empty = make("TextLabel", {
             Text = STATE.tab == "local"
-                and "No matching eggs in this server.\nRun the scan again, or check SCHEMA if the game renamed things."
+                and string.format(
+                    "%d eggs visible, 0 match the filter.\nYour filter: %s+ rarity and %.2fB/s minimum.\nUse SETTINGS to lower the income floor.",
+                    STATE.rawCount or 0, rarityName(STATE.minRank), STATE.minRate / 1e9)
                 or "No reports yet.\nServers running your build will appear here.",
             Size = UDim2.new(1, -8, 0, 68), BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
             TextColor3 = THEME.muted, TextWrapped = true, LayoutOrder = 1, ZIndex = 5,
@@ -1011,9 +1078,22 @@ filterButton.MouseButton1Click:Connect(function()
 end)
 
 refreshButton.MouseButton1Click:Connect(function()
-    STATE.status = "scanning…"
-    STATE.entries = scanOnce()
-    STATE.status = string.format("%d eggs in this server", #STATE.entries)
+    notify("scanning…", 2)
+    local ok, entries = pcall(scanOnce)
+    if not ok or type(entries) ~= "table" then
+        notify("scan error: " .. tostring(entries), 6)
+        return
+    end
+    -- REFRESH used to assign the raw scan straight to STATE.entries, skipping the
+    -- min-income / min-rarity filter. The next scan tick (1 s later) applied the
+    -- filter, found nothing above the floor, and the list went blank: exactly the
+    -- "cards appear, then 'No matching eggs'" behaviour.
+    STATE.entries = filterEntries(entries)
+    STATE.rawCount = #entries
+    STATE.status = string.format("%d eggs • %s", #STATE.entries,
+        CAPS.moduleApi and "module api" or "attribute scan")
+    notify(string.format("%d eggs above %.2fB and %s+", #STATE.entries,
+        STATE.minRate / 1e9, rarityName(STATE.minRank)), 4)
     if STATE.tab == "local" then render() end
 end)
 
@@ -1055,7 +1135,8 @@ end)
 
 rateBox.FocusLost:Connect(function()
     local amount = tonumber((tostring(rateBox.Text):gsub("[^%d%.]", "")))
-    if amount and amount >= 0.1 and amount <= 50 then
+    if amount and amount >= 0 and amount <= 50 then
+        if amount < 0.1 then amount = 0 end -- 0 = show everything
         CONFIG.MIN_RATE = amount * 1e9
         STATE.minRate = CONFIG.MIN_RATE
         rateBox.Text = string.format("%gB", amount)
@@ -1063,7 +1144,7 @@ rateBox.FocusLost:Connect(function()
         render()
     else
         rateBox.Text = string.format("%gB", CONFIG.MIN_RATE / 1e9)
-        notify("enter a value from 0.1B to 50B")
+        notify("enter 0 to 50 (B/s) — e.g. 0.25 for 250M/s")
     end
 end)
 
@@ -1084,13 +1165,9 @@ task.spawn(function()
     while gui.Parent do
         local ok, entries = pcall(scanOnce)
         if ok and type(entries) == "table" then
-            local filtered = {}
-            for _, entry in ipairs(entries) do
-                if (entry.rate or 0) >= STATE.minRate and displayRank(entry) >= STATE.minRank then
-                    filtered[#filtered + 1] = entry
-                end
-            end
+            local filtered = filterEntries(entries)
             STATE.entries = filtered
+            STATE.rawCount = #entries
             STATE.scanAge = os.clock()
             STATE.status = string.format("%d eggs • %s", #filtered, CAPS.moduleApi and "module api" or "attribute scan")
             pcall(function()
@@ -1172,3 +1249,15 @@ end)
 render()
 paintTabs()
 log("M0x46 Finder loaded — hotkey", CONFIG.HOTKEY.Name, "| source:", CAPS.moduleApi and "module" or "attributes")
+
+-- Fail loudly instead of showing "HTTP 0" forever.
+if CONFIG.BROADCAST then
+    if not CAPS.network then
+        log("WARNING: this executor exposes no HTTP function — the feed is OFF")
+    elseif CONFIG.ENDPOINT:find("127%.0%.0%.1") or CONFIG.ENDPOINT:find("localhost") then
+        log("WARNING: ENDPOINT is still the local default (" .. CONFIG.ENDPOINT ..
+            ") — the game cannot reach your PC. Set CONFIG.ENDPOINT to your public backend URL.")
+    elseif CONFIG.ROOM_KEY == "changeme" then
+        log("WARNING: ROOM_KEY is still 'changeme' — set it to the same value you started the server with")
+    end
+end
