@@ -54,7 +54,7 @@ local CONFIG = {
     -- Your established X-Egg-Room backend remains the optional fallback.
     -- NYX is tried first; its separate credential is NEVER stored in this file.
     ENDPOINT = "https://m0x46-iqjlgk34.back4.app", -- own backend, no trailing slash
-    ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI", -- must equal your backend ROOM_KEY
+    ROOM_KEY = tostring((type(getgenv) == "function" and getgenv() or _G).M0x46_ROOM_KEY or ""), -- set this locally before running
 
     HOTKEY = Enum.KeyCode.RightControl,
 
@@ -1073,10 +1073,11 @@ end
 -- Visual reference: compact neon operations console. This is an original layout
 -- and keeps M0x46's feed/auth/data pipeline; it imports no third-party assets.
 --==============================================================================
+local GuiService = game:GetService("GuiService")
 local THEME = {
     bg = Color3.fromRGB(5, 5, 7),
     panel = Color3.fromRGB(13, 10, 12),
-    panelHigh = Color3.fromRGB(25, 14, 17),
+    panelHigh = Color3.fromRGB(23, 14, 18),
     panelLow = Color3.fromRGB(8, 7, 8),
     red = Color3.fromRGB(235, 29, 47),
     redHot = Color3.fromRGB(255, 71, 71),
@@ -1140,6 +1141,12 @@ end
 -- ROOT GUI AND CONTROLS
 --==============================================================================
 local UI = {}
+local connections = {}
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    connections[#connections + 1] = connection
+    return connection
+end
 local oldGui = playerGui:FindFirstChild("M0x46Finder")
 if oldGui then oldGui:Destroy() end
 UI.gui = make("ScreenGui", {
@@ -1155,8 +1162,8 @@ local function viewport()
     return 1280, 720
 end
 
-local MOBILE_TOPBAR, SCREEN_MARGIN = 44, 8
-UI.panelX, UI.panelY, UI.panelW, UI.panelH = 18, 64, 780, 520
+local SCREEN_MARGIN = 12
+UI.panelX, UI.panelY, UI.panelW, UI.panelH = 18, 64, 680, 410
 
 UI.launcher = make("TextButton", {
     Name = "Launcher", Text = "M0x46", Position = UDim2.fromOffset(18, 120),
@@ -1169,7 +1176,7 @@ stroke(UI.launcher, THEME.redHot, 2, 0.05)
 make("UIGradient", { Rotation = 45, Color = ColorSequence.new(THEME.redDeep, THEME.red) }, UI.launcher)
 UI.launcherDot = make("Frame", {
     Name = "Live", Position = UDim2.new(1, -14, 0, 7), Size = UDim2.fromOffset(9, 9),
-    BackgroundColor3 = THEME.green, BorderSizePixel = 0, ZIndex = 42,
+    BackgroundColor3 = THEME.muted, BorderSizePixel = 0, ZIndex = 42,
 }, UI.launcher)
 corner(999, UI.launcherDot)
 stroke(UI.launcherDot, THEME.bg, 2, 0.1)
@@ -1184,15 +1191,22 @@ stroke(UI.panel, THEME.red, 2, 0.08)
 make("UIGradient", { Rotation = 90, Color = ColorSequence.new(THEME.panel, THEME.bg) }, UI.panel)
 UI.panelScale = make("UIScale", { Scale = 1 }, UI.panel)
 
--- Original red framing, deliberately lightweight: no RenderStepped or looping FX.
+-- Original red framing.
 local edge = make("Frame", {
     Name = "RedEdge", Position = UDim2.fromOffset(0, 0), Size = UDim2.new(1, 0, 1, 0),
     BackgroundTransparency = 1, BorderSizePixel = 0, Active = false, ZIndex = 11,
 }, UI.panel)
 corner(12, edge)
 stroke(edge, THEME.redHot, 5, 0.78)
+local accentSlash = make("Frame", {
+    Name = "AccentSlash", AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0, 42, 1, -54), Size = UDim2.fromOffset(150, 9),
+    Rotation = -42, BackgroundColor3 = THEME.red, BackgroundTransparency = 0.4,
+    BorderSizePixel = 0, ZIndex = 11,
+}, UI.panel)
+make("UIGradient", { Color = ColorSequence.new(THEME.redDeep, THEME.redHot) }, accentSlash)
 UI.sidebar = make("Frame", {
-    Name = "Sidebar", BackgroundColor3 = THEME.panelLow, BorderSizePixel = 0, ZIndex = 12,
+    Name = "Sidebar", BackgroundColor3 = THEME.panelLow, BackgroundTransparency = 0.12, BorderSizePixel = 0, ZIndex = 12,
 }, UI.panel)
 stroke(UI.sidebar, THEME.line, 1, 0.18)
 UI.brand = label(UI.sidebar, "M0x46\nFINDER", UDim2.fromOffset(10, 9), UDim2.new(1, -20, 0, 36), THEME.text, 15)
@@ -1215,7 +1229,7 @@ UI.header = make("Frame", {
 }, UI.panel)
 corner(10, UI.header)
 stroke(UI.header, THEME.line, 1, 0.28)
-UI.title = label(UI.panel, "M0x46 // LIVE FEED", UDim2.new(), UDim2.new(), THEME.text, 17)
+UI.title = label(UI.panel, "LIVE FEED", UDim2.new(), UDim2.new(), THEME.text, 17)
 UI.title.Font = Enum.Font.GothamBlack
 UI.title.ZIndex = 14
 UI.statusText = label(UI.panel, "connecting…", UDim2.new(), UDim2.new(), THEME.muted, 10)
@@ -1227,7 +1241,7 @@ UI.closeButton.TextColor3 = THEME.redHot
 UI.autoJoinToggle = button(UI.panel, { Name = "AutoJoinToggle", Text = "AUTO-JOIN: OFF", CornerRadius = 9, ZIndex = 15 }, false)
 UI.autoForceToggle = button(UI.panel, { Name = "AutoForceToggle", Text = "AUTO-FORCE: OFF", CornerRadius = 9, ZIndex = 15 }, false)
 UI.filterButton = button(UI.panel, { Name = "RarityFilter", Text = "RARITY: ANY", CornerRadius = 8, ZIndex = 14 }, false)
-UI.refreshButton = button(UI.panel, { Name = "Refresh", Text = "REFRESH", CornerRadius = 8, ZIndex = 14 }, true)
+UI.refreshButton = button(UI.panel, { Name = "Refresh", Text = "↻", CornerRadius = 8, ZIndex = 14 }, true)
 UI.clearButton = button(UI.panel, { Name = "Clear", Text = "CLEAR", CornerRadius = 8, ZIndex = 14 }, false)
 
 UI.localTab = button(UI.panel, { Name = "TabLocal", Text = "MY SERVER", CornerRadius = 7, ZIndex = 14 }, false)
@@ -1257,13 +1271,13 @@ make("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2),
 
 -- Settings is an in-panel, scrollable diagnostic drawer so mobile never clips it.
 UI.overlay = make("Frame", {
-    Name = "SettingsOverlay", Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 1),
+    Active = true, Name = "SettingsOverlay", Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 1),
     BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.01, BorderSizePixel = 0,
     Visible = false, ZIndex = 50,
 }, UI.panel)
 corner(12, UI.overlay)
 stroke(UI.overlay, THEME.red, 1.6, 0.12)
-UI.overlayTitle = label(UI.overlay, "SETTINGS // SOURCE DIAGNOSTICS", UDim2.fromOffset(16, 12), UDim2.new(1, -70, 0, 22), THEME.text, 15)
+UI.overlayTitle = label(UI.overlay, "SETTINGS", UDim2.fromOffset(16, 12), UDim2.new(1, -70, 0, 22), THEME.text, 15)
 UI.overlayTitle.Font = Enum.Font.GothamBlack
 UI.overlayTitle.ZIndex = 51
 UI.overlayClose = button(UI.overlay, { Name = "SettingsClose", Text = "×", Position = UDim2.new(1, -42, 0, 10), Size = UDim2.fromOffset(30, 28), TextSize = 16, CornerRadius = 8, ZIndex = 52 }, false)
@@ -1277,10 +1291,9 @@ UI.overlayBody = make("ScrollingFrame", {
 make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, UI.overlayBody)
 make("UIPadding", { PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 10) }, UI.overlayBody)
 
--- FORCE is deliberately confirmation-gated. This dialog is not an access bypass:
--- it only decides whether to call Roblox's normal TeleportToPlaceInstance API.
+-- FORCE confirmation dialog; the existing confirmation handler is retained below.
 UI.forceModal = make("Frame", {
-    Name = "ForceConfirm", Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 1),
+    Active = true, Name = "ForceConfirm", Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 1),
     BackgroundColor3 = Color3.fromRGB(0, 0, 0), BackgroundTransparency = 0.18,
     BorderSizePixel = 0, Visible = false, ZIndex = 80,
 }, UI.panel)
@@ -1317,10 +1330,10 @@ for index, preset in ipairs({ { "OFF", 0 }, { "250M", 2.5e8 }, { "1B", 1e9 }, { 
     }, false)
     UI.presetButtons[#UI.presetButtons + 1] = { button = item, value = preset[2] }
 end
-local rateHint = label(UI.rateRow, "NYX receives this floor; 1B/s is the safe default", UDim2.fromOffset(2, 55), UDim2.new(1, -4, 0, 14), THEME.muted, 9)
+local rateHint = label(UI.rateRow, "Minimum income sent to the feed", UDim2.fromOffset(2, 55), UDim2.new(1, -4, 0, 14), THEME.muted, 9)
 rateHint.Font = Enum.Font.Gotham
 
-UI.broadcastToggle = button(UI.overlayBody, { Name = "BroadcastToggle", Text = "BROADCAST: ON", Size = UDim2.new(1, -10, 0, 36), LayoutOrder = 2, CornerRadius = 8, ZIndex = 52 }, false)
+UI.broadcastToggle = button(UI.overlayBody, { Name = "BroadcastToggle", Text = "BROADCAST: OFF", Size = UDim2.new(1, -10, 0, 36), LayoutOrder = 2, CornerRadius = 8, ZIndex = 52 }, false)
 UI.infoRow = label(UI.overlayBody, "", UDim2.new(), UDim2.new(1, -10, 0, 220), THEME.muted, 10)
 UI.infoRow.Name = "Diagnostics"
 UI.infoRow.LayoutOrder = 3
@@ -1328,139 +1341,236 @@ UI.infoRow.TextWrapped = true
 UI.infoRow.TextYAlignment = Enum.TextYAlignment.Top
 UI.infoRow.ZIndex = 52
 
--- Responsive landscape layout. It changes positions/sizes only; cards are pooled
--- separately and no per-frame animation work is performed.
+-- Presentation controls; the original public buttons remain TextButtons.
+local switchParts = {}
+for _, control in ipairs({UI.autoJoinToggle, UI.autoForceToggle}) do
+    control.TextXAlignment = Enum.TextXAlignment.Left
+    make("UIPadding", {PaddingLeft = UDim.new(0, 10)}, control)
+    local track = make("Frame", {
+        Name = "SwitchTrack", AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(34, 19),
+        BackgroundColor3 = THEME.line, BorderSizePixel = 0, ZIndex = 16,
+    }, control)
+    corner(99, track)
+    local thumb = make("Frame", {
+        Name = "Thumb", Position = UDim2.fromOffset(3, 3), Size = UDim2.fromOffset(13, 13),
+        BackgroundColor3 = THEME.text, BorderSizePixel = 0, ZIndex = 17,
+    }, track)
+    corner(99, thumb)
+    switchParts[control] = {track = track, thumb = thumb}
+end
+UI.minusButton = button(UI.panel, {Name = "SizeDown", Text = "−", TextSize = 18, ZIndex = 20}, false)
+UI.plusButton = button(UI.panel, {Name = "SizeUp", Text = "+", TextSize = 16, ZIndex = 20}, false)
+UI.resizeHandle = button(UI.panel, {Name = "ResizeGrip", Text = "◢", TextSize = 17, ZIndex = 22}, false)
+UI.resizeHandle.TextColor3 = THEME.redHot
+UI.totalLabel = label(UI.panel, "0 shown", UDim2.new(), UDim2.new(), THEME.muted, 10)
+UI.totalLabel.TextXAlignment = Enum.TextXAlignment.Right; UI.totalLabel.ZIndex = 14
+local feedDot = make("Frame", {Name = "FeedDot", BackgroundColor3 = THEME.red,
+    BorderSizePixel = 0, ZIndex = 14}, UI.panel)
+corner(99, feedDot)
+local footerLine = make("Frame", {Name = "FooterLine", BackgroundColor3 = THEME.line,
+    BackgroundTransparency = 0.45, BorderSizePixel = 0, ZIndex = 13}, UI.panel)
+local dragHint = label(UI.header, "• • •", UDim2.new(0.5, -20, 0, 0), UDim2.fromOffset(40, 9), THEME.redDeep, 9)
+dragHint.TextXAlignment = Enum.TextXAlignment.Center; dragHint.ZIndex = 15
+UI.header.Active = true; UI.brand.Active = true; dragHint.Active = true
+
+-- Settings remains scrollable at the smallest supported window size.
+UI.windowRow = make("Frame", {Name = "WindowSize", BackgroundTransparency = 1,
+    Size = UDim2.new(1, -10, 0, 65), LayoutOrder = 2, ZIndex = 51}, UI.overlayBody)
+label(UI.windowRow, "WINDOW SIZE", UDim2.fromOffset(2, 0), UDim2.new(1, -4, 0, 16), THEME.muted, 10).ZIndex = 52
+UI.windowMinus = button(UI.windowRow, {Name = "Smaller", Text = "−", Position = UDim2.fromOffset(0, 23), Size = UDim2.new(0.25, -4, 0, 32), ZIndex = 52}, false)
+UI.windowPlus = button(UI.windowRow, {Name = "Larger", Text = "+", Position = UDim2.new(0.25, 2, 0, 23), Size = UDim2.new(0.25, -4, 0, 32), ZIndex = 52}, false)
+UI.resetSizeButton = button(UI.windowRow, {Name = "ResetSize", Text = "RESET SIZE", Position = UDim2.new(0.5, 4, 0, 23), Size = UDim2.new(0.5, -4, 0, 32), ZIndex = 52}, true)
+UI.filterButton.Parent = UI.overlayBody
+UI.filterButton.LayoutOrder = 3; UI.filterButton.Size = UDim2.new(1, -10, 0, 34); UI.filterButton.ZIndex = 52
+UI.broadcastToggle.LayoutOrder = 4
+UI.infoRow.LayoutOrder = 5
+UI.infoRow.Size = UDim2.new(1, -10, 0, 260)
+
+local function screenBounds()
+    local w, h = viewport()
+    local left, top, right, bottom = SCREEN_MARGIN, SCREEN_MARGIN, w - SCREEN_MARGIN, h - SCREEN_MARGIN
+    local ok, a, b = pcall(function() return GuiService:GetGuiInset() end)
+    if ok and a and b then
+        left = math.max(left, a.X + SCREEN_MARGIN)
+        top = math.max(top, a.Y + SCREEN_MARGIN)
+        right = math.min(right, w - b.X - SCREEN_MARGIN)
+        bottom = math.min(bottom, h - b.Y - SCREEN_MARGIN)
+    end
+    return left, top, math.max(left + 1, right), math.max(top + 1, bottom)
+end
+local function sizeLimits()
+    local l, t, r, b = screenBounds()
+    local aw, ah = r - l, b - t
+    local maxW, maxH = math.floor(aw * 0.94), math.floor(ah * 0.9)
+    return math.min(300, maxW), math.min(228, maxH), maxW, maxH
+end
+local function box(object, x, y, w, h)
+    object.Position = UDim2.fromOffset(math.floor(x), math.floor(y))
+    object.Size = UDim2.fromOffset(math.max(1, math.floor(w)), math.max(1, math.floor(h)))
+end
 function UI.clampPanel()
-    local vw, vh = viewport()
-    local maxH = math.max(230, vh - MOBILE_TOPBAR - SCREEN_MARGIN)
-    UI.panelW = clamp(UI.panelW, math.min(320, vw - 16), math.min(820, vw - 16))
-    UI.panelH = clamp(UI.panelH, math.min(248, maxH), math.min(590, maxH))
-    UI.panelX = clamp(UI.panelX, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - UI.panelW - SCREEN_MARGIN))
-    UI.panelY = clamp(UI.panelY, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - UI.panelH - SCREEN_MARGIN))
-    UI.panel.Size = UDim2.fromOffset(UI.panelW, UI.panelH)
-    UI.panel.Position = UDim2.fromOffset(UI.panelX, UI.panelY)
-
-    local compact = UI.panelW < 520 or UI.panelH < 390
-    local side = compact and 76 or 142
-    local contentX, contentW = side + 8, UI.panelW - side - 16
-    local headerH = compact and 48 or 62
-    UI.sidebar.Position = UDim2.fromOffset(0, 0)
-    UI.sidebar.Size = UDim2.fromOffset(side, UI.panelH)
-    UI.brand.Position = UDim2.fromOffset(compact and 7 or 12, 9)
-    UI.brand.Size = UDim2.new(1, -14, 0, compact and 30 or 38)
-    UI.brand.TextSize = compact and 10 or 15
-    UI.connectionDot.Position = UDim2.fromOffset(compact and 8 or 13, compact and 43 or 54)
-    UI.connectionDot.Size = UDim2.fromOffset(compact and 7 or 9, compact and 7 or 9)
-    UI.connectionLabel.Position = UDim2.fromOffset(compact and 18 or 27, compact and 38 or 49)
-    UI.connectionLabel.Size = UDim2.new(1, -(compact and 20 or 30), 0, 16)
-    UI.connectionLabel.TextSize = compact and 7 or 9
-    local navY, navH, navGap = compact and 65 or 84, compact and 27 or 36, compact and 4 or 6
-    for index, control in ipairs({ UI.logsButton, UI.historyButton, UI.settingsButton, UI.usersButton }) do
-        control.Position = UDim2.fromOffset(compact and 5 or 8, navY + (index - 1) * (navH + navGap))
-        control.Size = UDim2.new(1, compact and -10 or -16, 0, navH)
-        control.TextSize = compact and 8 or 11
-        control.Text = compact and ({ "LOG", "HIST", "SET", "USERS" })[index]
-            or ({ "◉  LOGS", "◷  HISTORY", "⚙  SETTINGS", "◌  USERS" })[index]
+    local l, t, r, b = screenBounds()
+    local minW, minH, maxW, maxH = sizeLimits()
+    UI.panelW, UI.panelH = clamp(UI.panelW, minW, maxW), clamp(UI.panelH, minH, maxH)
+    UI.panelX = clamp(UI.panelX, l, r - UI.panelW)
+    UI.panelY = clamp(UI.panelY, t, b - UI.panelH)
+    box(UI.panel, UI.panelX, UI.panelY, UI.panelW, UI.panelH)
+    local compact = UI.panelW < 560
+    local side = compact and 78 or 136
+    local x, w = side + 12, UI.panelW - side - 24
+    UI.contentW = w
+    box(UI.sidebar, 0, 0, side, UI.panelH)
+    box(UI.header, 4, 0, UI.panelW - 8, 10)
+    UI.header.BackgroundTransparency = 1
+    box(UI.brand, compact and 9 or 14, 16, side - (compact and 16 or 24), 36)
+    UI.brand.TextSize = compact and 13 or 18
+    UI.brand.Text = "M0x46\nFINDER"
+    box(UI.connectionDot, compact and 10 or 15, 58, 6, 6)
+    box(UI.connectionLabel, compact and 22 or 27, 53, side - (compact and 26 or 30), 16)
+    UI.connectionLabel.TextSize = compact and 9 or 10
+    local navH = UI.panelH < 290 and 24 or 34
+    local navY = UI.panelH < 290 and 76 or 88
+    for i, control in ipairs({UI.logsButton, UI.historyButton, UI.settingsButton, UI.usersButton}) do
+        box(control, 7, navY + (i - 1) * (navH + 5), side - 14, navH)
+        control.Text = (compact and {"LOGS", "HISTORY", "SETTINGS", "USERS"} or {"◉  Logs", "◷  History", "⚙  Settings", "◌  Users"})[i]
+        control.TextXAlignment = Enum.TextXAlignment.Center
+        control.TextSize = compact and 9 or 12
     end
-    UI.hideButton.Position = UDim2.new(0, compact and 5 or 8, 1, -(compact and 33 or 43))
-    UI.hideButton.Size = UDim2.new(1, compact and -10 or -16, 0, compact and 27 or 34)
-    UI.hideButton.TextSize = compact and 8 or 11
+    box(UI.hideButton, 7, UI.panelH - 37, side - 14, 28)
+    UI.hideButton.Text = compact and "× HIDE" or "×  Hide"
+    UI.hideButton.TextSize = compact and 10 or 12
 
-    UI.header.Position = UDim2.fromOffset(contentX, 8)
-    UI.header.Size = UDim2.fromOffset(contentW, headerH)
-    UI.title.Position = UDim2.fromOffset(contentX + 10, 13)
-    UI.title.Size = UDim2.fromOffset(math.max(88, contentW * 0.42), 20)
-    UI.title.TextSize = compact and 11 or 17
-    UI.statusText.Position = UDim2.fromOffset(contentX + 10, compact and 31 or 37)
-    UI.statusText.Size = UDim2.fromOffset(math.max(90, contentW * 0.44), 15)
-    UI.statusText.TextSize = compact and 8 or 10
-    UI.closeButton.Position = UDim2.fromOffset(contentX + contentW - 34, 17)
-    UI.closeButton.Size = UDim2.fromOffset(26, 25)
-    UI.autoJoinToggle.Position = UDim2.fromOffset(contentX + contentW - (compact and 172 or 226), compact and 12 or 15)
-    UI.autoJoinToggle.Size = UDim2.fromOffset(compact and 82 or 108, compact and 24 or 30)
-    UI.autoForceToggle.Position = UDim2.fromOffset(contentX + contentW - (compact and 86 or 114), compact and 12 or 15)
-    UI.autoForceToggle.Size = UDim2.fromOffset(compact and 80 or 108, compact and 24 or 30)
-    UI.autoJoinToggle.TextSize, UI.autoForceToggle.TextSize = compact and 7 or 9, compact and 7 or 9
-
-    local toolY = headerH + 16
-    UI.filterButton.Position = UDim2.fromOffset(contentX, toolY)
-    UI.filterButton.Size = UDim2.fromOffset(math.floor(contentW * 0.34), compact and 25 or 30)
-    UI.refreshButton.Position = UDim2.fromOffset(contentX + math.floor(contentW * 0.34) + 5, toolY)
-    UI.refreshButton.Size = UDim2.fromOffset(math.floor(contentW * 0.33), compact and 25 or 30)
-    UI.clearButton.Position = UDim2.fromOffset(contentX + math.floor(contentW * 0.68) + 10, toolY)
-    UI.clearButton.Size = UDim2.fromOffset(math.max(43, contentW - math.floor(contentW * 0.68) - 10), compact and 25 or 30)
-    UI.filterButton.TextSize, UI.refreshButton.TextSize, UI.clearButton.TextSize = compact and 8 or 10, compact and 8 or 10, compact and 8 or 10
-
-    local tabY = toolY + (compact and 31 or 37)
-    UI.localTab.Position = UDim2.fromOffset(contentX, tabY)
-    UI.localTab.Size = UDim2.fromOffset(math.floor((contentW - 5) / 2), compact and 22 or 28)
-    UI.feedTab.Position = UDim2.fromOffset(contentX + math.floor((contentW - 5) / 2) + 5, tabY)
-    UI.feedTab.Size = UDim2.fromOffset(math.floor((contentW - 5) / 2), compact and 22 or 28)
-    UI.localTab.TextSize, UI.feedTab.TextSize = compact and 8 or 10, compact and 8 or 10
-
-    local chipY, chipH = tabY + (compact and 27 or 34), compact and 16 or 19
-    local chipW = math.max(42, math.floor((contentW - 9) / 4))
-    for index, chip in ipairs({ UI.countJoin, UI.countTaken, UI.countFull, UI.countUnknown }) do
-        chip.Position = UDim2.fromOffset(contentX + (index - 1) * (chipW + 3), chipY)
-        chip.Size = UDim2.fromOffset(chipW, chipH)
-        chip.TextSize = compact and 7 or 9
+    local toggleW = math.floor((w - 8) / 2)
+    box(UI.autoJoinToggle, x, 14, toggleW, 34)
+    box(UI.autoForceToggle, x + toggleW + 8, 14, toggleW, 34)
+    for control, parts in pairs(switchParts) do
+        local tiny = toggleW < 130
+        local tw, th = tiny and 26 or 34, tiny and 16 or 19
+        parts.track.Size = UDim2.fromOffset(tw, th)
+        parts.track.Position = UDim2.new(1, -6, 0.5, 0)
+        parts.thumb.Size = UDim2.fromOffset(th - 6, th - 6)
+        local on = (control == UI.autoJoinToggle and CONFIG.AUTO_JOIN) or (control == UI.autoForceToggle and CONFIG.AUTO_FORCE)
+        parts.thumb.Position = UDim2.fromOffset(on and tw - th + 3 or 3, 3)
+        control.TextSize = tiny and 9 or 11
+        control.Text = control == UI.autoJoinToggle and (tiny and "A-JOIN" or "Auto-Join") or (tiny and "A-FORCE" or "Auto-Force")
     end
-    local listY = chipY + chipH + 7
-    UI.list.Position = UDim2.fromOffset(contentX, listY)
-    UI.list.Size = UDim2.fromOffset(contentW, math.max(44, UI.panelH - listY - 8))
+    box(feedDot, x, 63, 6, 6)
+    box(UI.title, x + 12, 56, w - 140, 20)
+    UI.title.TextSize = w < 290 and 10 or 12
+    UI.title.Text = STATE.tab == "all" and "LIVE FEED" or "MY SERVER"
+    box(UI.totalLabel, x + w - 124, 56, 50, 20)
+    UI.totalLabel.TextSize = 9
+    box(UI.refreshButton, x + w - 66, 55, 27, 23)
+    UI.refreshButton.TextSize = 17
+    box(UI.clearButton, x + w - 34, 55, 34, 23)
+    UI.clearButton.TextSize = 9
+    UI.clearButton.Text = "Clear"
+    box(UI.localTab, x, 86, (w - 6) / 2, 25)
+    box(UI.feedTab, x + (w - 6) / 2 + 6, 86, (w - 6) / 2, 25)
+    UI.localTab.TextSize, UI.feedTab.TextSize = 10, 10
+    for i, chip in ipairs({UI.countJoin, UI.countTaken, UI.countFull, UI.countUnknown}) do
+        box(chip, x + (i - 1) * (w + 4) / 4, 118, (w - 12) / 4, 17)
+        chip.TextSize = 9
+    end
+    box(UI.list, x - 2, 143, w + 4, UI.panelH - 179)
+    box(footerLine, x, UI.panelH - 31, w, 1)
+    box(UI.statusText, x, UI.panelH - 26, w - 125, 19)
+    UI.statusText.TextSize = 9
+    box(UI.minusButton, x + w - 118, UI.panelH - 26, 26, 20)
+    box(UI.plusButton, x + w - 87, UI.panelH - 26, 26, 20)
+    box(UI.closeButton, x + w - 56, UI.panelH - 26, 24, 20)
+    box(UI.resizeHandle, UI.panelW - 29, UI.panelH - 29, 24, 24)
+    UI.resizeHandle.BackgroundTransparency = 1
 end
-
 function UI.clampLauncher()
-    local vw, vh = viewport()
+    local l, t, r, b = screenBounds()
     local p = UI.launcher.Position
-    UI.launcher.Position = UDim2.fromOffset(
-        clamp(p.X.Offset, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - 60 - SCREEN_MARGIN)),
-        clamp(p.Y.Offset, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - 60 - SCREEN_MARGIN))
-    )
+    UI.launcher.Position = UDim2.fromOffset(clamp(p.X.Offset, l, math.max(l, r - 60)), clamp(p.Y.Offset, t, math.max(t, b - 60)))
 end
-
-function UI.cardHeight()
-    return UI.panelH < 330 and 64 or UI.panelH < 450 and 82 or 98
-end
-
+function UI.cardHeight() return (UI.contentW or 400) < 310 and 86 or 76 end
 function UI.applyLayout()
-    UI.clampPanel()
-    UI.clampLauncher()
+    UI.clampPanel(); UI.clampLauncher()
     markDirty()
+    if UI.reflowCards then UI.reflowCards() end
+    if UI.paintCounts then UI.paintCounts() end
+end
+function UI.resize(width, height)
+    UI.panelW, UI.panelH = tonumber(width) or UI.panelW, tonumber(height) or UI.panelH
+    UI.applyLayout()
+end
+function UI.resizeBy(factor)
+    factor = tonumber(factor)
+    if not validNumber(factor) or factor <= 0 then return end
+    local cx, cy = UI.panelX + UI.panelW / 2, UI.panelY + UI.panelH / 2
+    local minW, minH, maxW, maxH = sizeLimits()
+    UI.panelW, UI.panelH = clamp(UI.panelW * factor, minW, maxW), clamp(UI.panelH * factor, minH, maxH)
+    UI.panelX, UI.panelY = cx - UI.panelW / 2, cy - UI.panelH / 2
+    UI.applyLayout()
+end
+function UI.resetSize()
+    local l, t, r, b = screenBounds()
+    local aw, ah = r - l, b - t
+    local portrait = ah > aw
+    UI.panelW = math.min(760, aw * (portrait and 0.9 or 0.76))
+    UI.panelH = math.min(460, ah * (portrait and 0.55 or 0.74))
+    local minW, minH, maxW, maxH = sizeLimits()
+    UI.panelW, UI.panelH = clamp(UI.panelW, minW, maxW), clamp(UI.panelH, minH, maxH)
+    UI.panelX, UI.panelY = l + (aw - UI.panelW) / 2, t + (ah - UI.panelH) / 2
+    UI.applyLayout()
 end
 
-do
-    local dragging, target, startMouse, startOffset = false, nil, nil, nil
-    local function beginDrag(handle, object)
-        handle.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                dragging, target, startMouse, startOffset = true, object, input.Position, object.Position
-            end
-        end)
+-- One input owner: a second touch cannot hijack dragging/resizing.
+local gesture, suppressLauncher = nil, false
+local function begin(handle, mode)
+    connect(handle.InputBegan, function(input)
+        if gesture then return end
+        local touch = input.UserInputType == Enum.UserInputType.Touch
+        if not touch and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        gesture = {mode = mode, input = input, touch = touch, x = input.Position.X, y = input.Position.Y,
+            px = UI.panelX, py = UI.panelY, w = UI.panelW, h = UI.panelH,
+            lx = UI.launcher.Position.X.Offset, ly = UI.launcher.Position.Y.Offset, moved = false}
+    end)
+end
+begin(UI.header, "move"); begin(UI.brand, "move"); begin(dragHint, "move")
+begin(UI.launcher, "launcher"); begin(UI.resizeHandle, "resize")
+connect(UserInputService.InputChanged, function(input)
+    local g = gesture
+    if not g then return end
+    if g.touch then if input ~= g.input then return end
+    elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    local dx, dy = input.Position.X - g.x, input.Position.Y - g.y
+    if math.abs(dx) + math.abs(dy) > 5 then g.moved = true end
+    if not g.moved then return end
+    if g.mode == "resize" then
+        UI.resize(g.w + dx, g.h + dy)
+    elseif g.mode == "move" then
+        local l, t, r, b = screenBounds()
+        UI.panelX, UI.panelY = clamp(g.px + dx, l, r - UI.panelW), clamp(g.py + dy, t, b - UI.panelH)
+        UI.panel.Position = UDim2.fromOffset(UI.panelX, UI.panelY)
+    else
+        UI.launcher.Position = UDim2.fromOffset(g.lx + dx, g.ly + dy)
+        UI.clampLauncher()
     end
-    beginDrag(UI.header, UI.panel)
-    beginDrag(UI.launcher, UI.launcher)
-    UserInputService.InputChanged:Connect(function(input)
-        if not dragging or not target then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        local delta, vw, vh = input.Position - startMouse, viewport()
-        local width, height = target == UI.panel and UI.panelW or 60, target == UI.panel and UI.panelH or 60
-        target.Position = UDim2.fromOffset(
-            clamp(startOffset.X.Offset + delta.X, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - width - SCREEN_MARGIN)),
-            clamp(startOffset.Y.Offset + delta.Y, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - height - SCREEN_MARGIN))
-        )
-    end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if target == UI.panel then UI.panelX, UI.panelY = UI.panel.Position.X.Offset, UI.panel.Position.Y.Offset end
-        dragging, target = false, nil
-    end)
-end
-
-pcall(function()
-    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(UI.applyLayout)
 end)
-
+connect(UserInputService.InputEnded, function(input)
+    local g = gesture
+    if not g then return end
+    if (g.touch and input ~= g.input) or (not g.touch and input.UserInputType ~= Enum.UserInputType.MouseButton1) then return end
+    if g.mode == "launcher" and g.moved then suppressLauncher = true end
+    gesture = nil
+end)
+local cameraConnection
+local function bindCamera()
+    if cameraConnection then cameraConnection:Disconnect() end
+    local camera = workspace.CurrentCamera
+    if camera then cameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        gesture = nil
+        UI.applyLayout()
+    end) end
+    UI.applyLayout()
+end
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
 
 --==============================================================================
 -- JOIN  (implementation must sit ABOVE the card renderer: a `local function`
@@ -1757,69 +1867,60 @@ end
 
 local function bindCard(slot, entry, index)
     if slot.root.Parent ~= UI.list then slot.root.Parent = UI.list end
-    local height = UI.cardHeight()
-    local compact = height <= 66
-    local action = actionAllowed(entry)
-    local state = STATUS.of(entry, NYX.now())
-    local statusText, statusColor = STATUS.text(entry), STATUS.color(entry)
-    local spec = raritySpec(entry)
-    local iconSize = compact and 30 or 42
-    local left = iconSize + 16
-    local actionW, gap = compact and 51 or 65, compact and 4 or 6
-    local right = action and (actionW * 2 + gap + 12) or 92
-    slot.root.Visible = true
-    slot.root.LayoutOrder = index
-    slot.root.Size = UDim2.new(1, -4, 0, height)
-    slot.root.BackgroundColor3 = state == "taken" and Color3.fromRGB(27, 10, 12) or CARD_BG
-    slot.strip.BackgroundColor3 = statusColor
-    slot.outline.Color = action and THEME.red or statusColor
-    slot.outline.Transparency = action and 0.22 or 0.36
-    slot.iconBack.Position = UDim2.fromOffset(8, math.floor((height - iconSize) / 2))
-    slot.iconBack.Size = UDim2.fromOffset(iconSize, iconSize)
-    slot.icon.Image = entry.icon or ""
-    slot.icon.Visible = entry.icon ~= nil
-    slot.glyph.Visible = entry.icon == nil
-    slot.glyph.TextColor3 = spec.color
-    slot.name.Text = tostring(entry.name)
-    slot.name.TextColor3 = spec.color
-    slot.name.Position = UDim2.fromOffset(left, 7)
-    slot.name.Size = UDim2.new(1, -(left + right), 0, compact and 16 or 21)
-    slot.name.TextSize = compact and 10 or 14
+    local h = UI.cardHeight()
+    local narrow = (UI.contentW or 400) < 310
+    local state, color, spec = STATUS.of(entry, NYX.now()), STATUS.color(entry), raritySpec(entry)
+    local action = actionAllowed(entry) and not entry.isLocal
+    local right = narrow and 66 or (action and 136 or 90)
+    local left = narrow and 47 or 58
+    slot.root.Visible = true; slot.root.LayoutOrder = index
+    slot.root.Size = UDim2.new(1, -6, 0, h)
+    slot.root.BackgroundColor3 = state == "taken" and Color3.fromRGB(25, 10, 14) or CARD_BG
+    slot.outline.Color, slot.outline.Transparency = THEME.red, 0.65
+    slot.strip.BackgroundColor3 = color
+    box(slot.iconBack, 10, narrow and 23 or 18, narrow and 28 or 34, narrow and 28 or 34)
+    slot.icon.Size = UDim2.fromScale(1, 1)
+    slot.icon.Image = entry.icon or ""; slot.icon.Visible = entry.icon ~= nil
+    slot.glyph.Visible = entry.icon == nil; slot.glyph.TextColor3 = spec.color; slot.glyph.TextSize = 22
+    slot.name.Text = tostring(entry.name or "Unknown")
+    slot.name.TextColor3 = THEME.text
+    box(slot.name, left, 8, (UI.contentW or 400) - left - right - 4, 17)
+    slot.name.TextSize = narrow and 11 or 13
     slot.income.Text = money(entry.rate)
-    slot.income.Position = UDim2.fromOffset(left, compact and 25 or 29)
-    slot.income.Size = UDim2.new(1, -(left + right), 0, compact and 14 or 17)
-    slot.income.TextSize = compact and 9 or 13
-    slot.rarity.Text = string.upper(tostring(entry.rarity)) .. "  •  " .. (entry.mutations and #entry.mutations > 0 and table.concat(entry.mutations, ", ") or "no mutation")
-    slot.rarity.Position = UDim2.fromOffset(left, compact and 40 or 48)
-    slot.rarity.Size = UDim2.new(1, -(left + right), 0, 12)
-    slot.rarity.TextSize = compact and 7 or 9
-    slot.server.Text = (entry.isLocal and "THIS SERVER" or "SERVER " .. shortId(entry.jobId))
-        .. (entry.area and ("  •  " .. tostring(entry.area)) or "")
-    slot.server.Position = UDim2.fromOffset(left, compact and 50 or 66)
-    slot.server.Size = UDim2.new(1, -(left + right), 0, 12)
-    slot.server.TextSize = compact and 7 or 9
+    box(slot.income, left, 28, (UI.contentW or 400) - left - right - 4, 17)
+    slot.income.TextSize = narrow and 11 or 12
+    slot.rarity.Text = tostring(entry.rarity or "Unknown") .. ((entry.mutations and #entry.mutations > 0) and (" • " .. table.concat(entry.mutations, ", ")) or "")
+    slot.rarity.TextColor3 = spec.color
+    box(slot.rarity, left, 48, (UI.contentW or 400) - left - right - 4, 12)
+    slot.rarity.TextSize = 9
+    slot.server.Text = (entry.isLocal and "THIS SERVER" or shortId(entry.jobId)) .. (entry.area and (" • " .. tostring(entry.area)) or "")
+    slot.server.TextSize = 9
+    box(slot.server, left, narrow and 66 or 61, (UI.contentW or 400) - left - right - 4, 12)
     slot.age.Text = reportAge(entry)
-    slot.age.Position = UDim2.new(1, -(right - 2), 0, compact and 5 or 7)
-    slot.age.Size = UDim2.fromOffset(right - 8, 13)
-    slot.age.TextSize = compact and 7 or 8
-    slot.status.Text, slot.status.TextColor3 = entry.isLocal and "HERE" or statusText, entry.isLocal and THEME.muted or statusColor
-    slot.status.Position = UDim2.new(1, -(right - 2), 0, compact and 19 or 24)
-    slot.status.Size = UDim2.fromOffset(right - 8, 15)
-    slot.status.TextSize = compact and 7 or 9
-    slot.join.Visible, slot.force.Visible = action and not entry.isLocal, action and not entry.isLocal
-    if action and not entry.isLocal then
-        local y, h = compact and 38 or 52, compact and 21 or 27
-        slot.join.Position = UDim2.new(1, -(actionW * 2 + gap + 8), 0, y)
-        slot.join.Size = UDim2.fromOffset(actionW, h)
-        slot.force.Position = UDim2.new(1, -(actionW + 8), 0, y)
-        slot.force.Size = UDim2.fromOffset(actionW, h)
-        slot.join.Text = slot.pending == "join" and "SURE?" or "JOIN"
-        slot.force.Text = "FORCE"
-        slot.join.TextSize, slot.force.TextSize = compact and 7 or 10, compact and 7 or 10
-        slot.join.BackgroundColor3 = THEME.redDeep
-        slot.force.BackgroundColor3 = THEME.panelHigh
+    slot.age.Visible = not narrow
+    box(slot.age, (UI.contentW or 400) - right, 58, right - 14, 12)
+    slot.age.TextSize = 9
+    slot.status.Text = entry.isLocal and "HERE" or STATUS.text(entry)
+    slot.status.TextColor3 = entry.isLocal and THEME.muted or color
+    box(slot.status, (UI.contentW or 400) - right, 8, right - 14, 14)
+    slot.status.TextSize = 9
+    slot.join.Visible, slot.force.Visible = action, action
+    if narrow then
+        box(slot.join, (UI.contentW or 400) - 63, 29, 49, 22)
+        box(slot.force, (UI.contentW or 400) - 63, 56, 49, 22)
+    else
+        box(slot.join, (UI.contentW or 400) - 136, 28, 58, 24)
+        box(slot.force, (UI.contentW or 400) - 72, 28, 58, 24)
     end
+    slot.join.Text, slot.force.Text = slot.pending == "join" and "SURE?" or "JOIN", "FORCE"
+    slot.join.TextSize, slot.force.TextSize = 10, 10
     slot.entry = entry
+end
+
+function UI.reflowCards()
+    for index, slot in ipairs(cardPool) do
+        if slot.entry and slot.root.Parent == UI.list then bindCard(slot, slot.entry, index) end
+    end
 end
 
 local function makeCard(entry, index)
@@ -1950,6 +2051,7 @@ local function render()
         return
     end
     local shown, matched = visibleList()
+    UI.totalLabel.Text = tostring(#shown) .. " shown"
     if STATE.tab == "all" then
         STATE.feedMatched = matched
         STATE.statusCounts = STATUS.count(STATE.feed, NYX.now())
@@ -2310,23 +2412,28 @@ local function paintSidebar()
 end
 
 function UI.paintCounts()
-    local counts = STATE.statusCounts or {}
-    UI.countJoin.Text = "JOINABLE " .. tostring(counts.joinable or 0)
-    UI.countTaken.Text = "TAKEN " .. tostring(counts.taken or 0)
-    UI.countFull.Text = "FULL " .. tostring(counts.full or 0)
-    UI.countUnknown.Text = "UNKNOWN " .. tostring(counts.unknown or 0)
+    local c = STATE.statusCounts or {}
+    local small = (UI.contentW or 400) < 310
+    UI.countJoin.Text = (small and "JOIN " or "JOINABLE ") .. tostring(c.joinable or 0)
+    UI.countTaken.Text = "TAKEN " .. tostring(c.taken or 0)
+    UI.countFull.Text = "FULL " .. tostring(c.full or 0)
+    UI.countUnknown.Text = (small and "UNK " or "UNKNOWN ") .. tostring(c.unknown or 0)
 end
-
 local function paintBroadcast()
     UI.broadcastToggle.Text = CONFIG.BROADCAST and "BROADCAST: ON" or "BROADCAST: OFF"
     UI.broadcastToggle.BackgroundColor3 = CONFIG.BROADCAST and Color3.fromRGB(22, 94, 48) or THEME.redDeep
 end
 
 local function paintAutos()
-    UI.autoJoinToggle.Text = CONFIG.AUTO_JOIN and "AUTO-JOIN: ON" or "AUTO-JOIN: OFF"
-    UI.autoJoinToggle.BackgroundColor3 = CONFIG.AUTO_JOIN and Color3.fromRGB(22, 94, 48) or THEME.panelHigh
-    UI.autoForceToggle.Text = CONFIG.AUTO_FORCE and "AUTO-FORCE: ON" or "AUTO-FORCE: OFF"
-    UI.autoForceToggle.BackgroundColor3 = CONFIG.AUTO_FORCE and THEME.redDeep or THEME.panelHigh
+    for control, part in pairs(switchParts) do
+        local on = (control == UI.autoJoinToggle and CONFIG.AUTO_JOIN) or (control == UI.autoForceToggle and CONFIG.AUTO_FORCE)
+        local tiny = control.Size.X.Offset < 130
+        control.Text = control == UI.autoJoinToggle and (tiny and "A-JOIN" or "Auto-Join") or (tiny and "A-FORCE" or "Auto-Force")
+        part.track.BackgroundColor3 = on and THEME.red or THEME.line
+        local w, h = part.track.Size.X.Offset, part.track.Size.Y.Offset
+        part.thumb.Position = UDim2.fromOffset(on and w - h + 3 or 3, 3)
+        control.BackgroundColor3 = on and THEME.redDeep or THEME.panelLow
+    end
 end
 
 local function paintFilter()
@@ -2514,11 +2621,20 @@ local function closeScript()
 end
 
 UI.launcher.MouseButton1Click:Connect(function()
+    if suppressLauncher or (gesture and gesture.mode == "launcher" and gesture.moved) then suppressLauncher = false; return end
     if UI.panel.Visible then minimizePanel() else openPanel() end
 end)
+connect(UI.launcher.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then suppressLauncher = false end
+end)
+UI.minusButton.MouseButton1Click:Connect(function() UI.resizeBy(1 / 1.1) end)
+UI.plusButton.MouseButton1Click:Connect(function() UI.resizeBy(1.1) end)
+UI.windowMinus.MouseButton1Click:Connect(function() UI.resizeBy(1 / 1.1) end)
+UI.windowPlus.MouseButton1Click:Connect(function() UI.resizeBy(1.1) end)
+UI.resetSizeButton.MouseButton1Click:Connect(UI.resetSize)
 UI.hideButton.MouseButton1Click:Connect(minimizePanel)
 UI.closeButton.MouseButton1Click:Connect(closeScript)
-UserInputService.InputBegan:Connect(function(input, processed)
+connect(UserInputService.InputBegan, function(input, processed)
     if processed or input.KeyCode ~= CONFIG.HOTKEY then return end
     if UI.panel.Visible then minimizePanel() else openPanel() end
 end)
@@ -2609,12 +2725,21 @@ task.spawn(function()
     end
 end)
 
-UI.gui.Destroying:Connect(function() end)
+UI.gui.Destroying:Connect(function()
+    gesture = nil
+    if cameraConnection then cameraConnection:Disconnect() end
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    for _, slot in ipairs(cardPool) do
+        if slot.root.Parent == nil then slot.root:Destroy() end
+    end
+    if UI.infoCard and UI.infoCard.root.Parent == nil then UI.infoCard.root:Destroy() end
+end)
 
 --==============================================================================
 -- BOOT
 --==============================================================================
-UI.applyLayout()
+UI.resetSize()
+bindCamera()
 probeApiBase()
 paintTabs()
 paintSidebar()
@@ -2670,3 +2795,4 @@ _G.M0x46_DIAG = setmetatable({}, {
         return nil
     end,
 })
+
