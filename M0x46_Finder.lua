@@ -41,8 +41,8 @@
 -- CONFIG  (edit this block only)
 --==============================================================================
 local CONFIG = {
-    ENDPOINT = "http://127.0.0.1:8080",   -- your backend, no trailing slash
-    ROOM_KEY = "changeme",                -- must equal ROOM_KEY on the server
+    ENDPOINT = "https://m0x46-iqjlgk34.back4.app",   -- your backend, no trailing slash
+    ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI",                -- must equal ROOM_KEY on the server
 
     HOTKEY = Enum.KeyCode.RightControl,
     SCAN_EVERY = 1,                       -- seconds between field scans
