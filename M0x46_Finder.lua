@@ -668,23 +668,25 @@ local function markDirty()
 end
 
 --==============================================================================
--- THEME + UI PRIMITIVES
+-- THEME  (glass premium: deep purple, neon accents, soft bevels)
 --==============================================================================
 local THEME = {
-    bg = Color3.fromRGB(9, 6, 18),
-    bgDeep = Color3.fromRGB(5, 3, 12),
-    glass = Color3.fromRGB(22, 16, 38),
-    glassHigh = Color3.fromRGB(34, 24, 58),
-    line = Color3.fromRGB(58, 42, 96),
-    accent = Color3.fromRGB(150, 92, 255),
-    accentHot = Color3.fromRGB(214, 96, 255),
-    cyan = Color3.fromRGB(86, 214, 255),
-    text = Color3.fromRGB(244, 240, 255),
-    muted = Color3.fromRGB(162, 150, 198),
-    green = Color3.fromRGB(96, 232, 156),
-    red = Color3.fromRGB(240, 104, 120),
+    bg = Color3.fromRGB(10, 7, 22),
+    bgDeep = Color3.fromRGB(5, 3, 14),
+    glass = Color3.fromRGB(26, 18, 46),
+    glassHigh = Color3.fromRGB(40, 28, 68),
+    line = Color3.fromRGB(110, 80, 185),
+    accent = Color3.fromRGB(147, 92, 255),
+    accentHot = Color3.fromRGB(213, 96, 255),
+    cyan = Color3.fromRGB(56, 205, 255),
+    text = Color3.fromRGB(245, 240, 255),
+    muted = Color3.fromRGB(176, 162, 210),
+    green = Color3.fromRGB(96, 235, 150),
+    red = Color3.fromRGB(238, 96, 106),
     amber = Color3.fromRGB(255, 202, 92),
+    tabActive = Color3.fromRGB(96, 58, 170),
 }
+local CARD_BG = Color3.fromRGB(26, 18, 46)
 
 local function make(class, props, parent)
     local object = Instance.new(class)
@@ -697,11 +699,15 @@ local function corner(radius, parent)
     return make("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
 end
 
-local function stroke(parent, color, thickness, transparency)
-    return make("UIStroke", {
+local function stroke(parent, color, thickness, transparency, gradientTo)
+    local object = make("UIStroke", {
         Color = color or THEME.line, Thickness = thickness or 1,
         Transparency = transparency or 0.3, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
     }, parent)
+    if gradientTo then
+        make("UIGradient", { Rotation = 55, Color = ColorSequence.new(color, gradientTo) }, object)
+    end
+    return object
 end
 
 local function label(parent, text, position, size, color, textSize)
@@ -718,7 +724,7 @@ local function button(parent, props, accent)
     -- Applying it via make() would throw before the launcher could appear.
     local radius = props.CornerRadius or 8
     local buttonProps = {}
-    for key, value in pairs(props) do
+    for key, value in pairs(props or {}) do
         if key ~= "CornerRadius" then buttonProps[key] = value end
     end
     local object = make("TextButton", buttonProps, parent)
@@ -734,6 +740,20 @@ local function button(parent, props, accent)
     return object
 end
 
+-- thin bevel lines: the "molded plastic" edge the reference cards have
+local function bevel(parent, zIndex)
+    make("Frame", {
+        Name = "BevelTop", Position = UDim2.fromOffset(3, 1), Size = UDim2.new(1, -6, 0, 1),
+        BackgroundColor3 = Color3.fromRGB(235, 230, 255), BackgroundTransparency = 0.62,
+        BorderSizePixel = 0, Active = false, ZIndex = zIndex or 12,
+    }, parent)
+    make("Frame", {
+        Name = "BevelBottom", Position = UDim2.new(0, 3, 1, -2), Size = UDim2.new(1, -6, 0, 1),
+        BackgroundColor3 = Color3.fromRGB(6, 3, 14), BackgroundTransparency = 0.1,
+        BorderSizePixel = 0, Active = false, ZIndex = zIndex or 12,
+    }, parent)
+end
+
 --==============================================================================
 -- ROOT GUI
 --==============================================================================
@@ -747,8 +767,8 @@ local gui = make("ScreenGui", {
     DisplayOrder = 1200,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, playerGui)
+pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)
 
--- viewport (guarded: cameras can be missing in test environments)
 local function viewport()
     local ok, camera = pcall(function() return workspace.CurrentCamera end)
     local size = ok and camera and camera.ViewportSize
@@ -762,101 +782,134 @@ end
 local MOBILE_TOPBAR, SCREEN_MARGIN = 44, 8
 
 --==============================================================================
--- LAUNCHER  (minimised state)
+-- LAUNCHER  (circular ring, like the reference's floating icon)
 --==============================================================================
-local launcher = button(gui, {
-    Name = "Launcher", Text = "M0x46",
-    Position = UDim2.new(0, 16, 0.5, -20), Size = UDim2.fromOffset(84, 40),
-    TextSize = 13, CornerRadius = 20, ZIndex = 40,
-}, true)
-launcher.Font = Enum.Font.GothamBlack
-make("UIGradient", {
-    Rotation = 30,
-    Color = ColorSequence.new(THEME.accent, THEME.accentHot),
+local launcher = make("TextButton", {
+    Name = "Launcher", Text = "M0x46", Position = UDim2.new(0, 18, 0.5, -31),
+    Size = UDim2.fromOffset(62, 62), BackgroundColor3 = THEME.accent,
+    BorderSizePixel = 0, AutoButtonColor = false, ZIndex = 40,
+    Font = Enum.Font.GothamBlack, TextSize = 13, TextColor3 = Color3.new(1, 1, 1),
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, gui)
+corner(999, launcher)
+make("UIGradient", { Rotation = 35, Color = ColorSequence.new(THEME.accent, THEME.accentHot) }, launcher)
+stroke(launcher, THEME.cyan, 2, 0.1)
+make("Frame", {
+    Name = "InnerRing", Position = UDim2.new(0, 5, 0, 5), Size = UDim2.new(1, -10, 1, -10),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 41,
 }, launcher)
-
+corner(999, launcher:FindFirstChild("InnerRing"))
+stroke(launcher:FindFirstChild("InnerRing"), Color3.fromRGB(255, 255, 255), 1, 0.7)
 local launcherDot = make("Frame", {
-    Name = "Live", Size = UDim2.fromOffset(7, 7), Position = UDim2.new(1, -14, 0, 9),
-    BackgroundColor3 = THEME.green, BorderSizePixel = 0, ZIndex = 41,
+    Name = "Live", Size = UDim2.fromOffset(9, 9), Position = UDim2.new(1, -13, 0, 8),
+    BackgroundColor3 = THEME.green, BorderSizePixel = 0, ZIndex = 43,
 }, launcher)
-corner(4, launcherDot)
+corner(999, launcherDot)
+stroke(launcherDot, Color3.fromRGB(10, 7, 22), 2, 0.2)
 
 --==============================================================================
--- PANEL
+-- PANEL SHELL
 --==============================================================================
 local panel = make("Frame", {
     Name = "Panel", Size = UDim2.fromOffset(404, 560),
-    Position = UDim2.new(0, 16, 0, 60),
+    Position = UDim2.new(0, 18, 0, 64),
     BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.04, BorderSizePixel = 0,
     Active = true, Visible = false, ClipsDescendants = true, ZIndex = 10,
 }, gui)
-corner(14, panel)
-local panelStroke = stroke(panel, THEME.accent, 1.4, 0.25)
-make("UIGradient", { Rotation = 50, Color = ColorSequence.new(THEME.accent, THEME.cyan) }, panelStroke)
+corner(12, panel)
+stroke(panel, THEME.accent, 1.5, 0.22, THEME.cyan)
 make("UIGradient", {
-    Rotation = 96,
-    Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(148, 132, 196)),
+    Rotation = 95,
+    Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(150, 138, 190)),
 }, panel)
+
+-- soft outer glow ring
+local edgeGlow = make("Frame", {
+    Name = "EdgeGlow", BackgroundTransparency = 1, BorderSizePixel = 0,
+    Position = UDim2.fromOffset(-4, -4), Size = UDim2.new(1, 8, 1, 8), Active = false, ZIndex = 9,
+}, panel)
+corner(16, edgeGlow)
+stroke(edgeGlow, THEME.accent, 6, 0.84)
+
 local panelScale = make("UIScale", { Scale = 1 }, panel)
 
--- backdrop dots ---------------------------------------------------------------
+-- backdrop: dots + three breathing nebulas (engine tweens only)
 local starfield = make("Frame", {
     Name = "Starfield", BackgroundTransparency = 1, BorderSizePixel = 0,
     Size = UDim2.fromScale(1, 1), Active = false, ZIndex = 1,
 }, panel)
 local starTweens = {}
 do
-    local random = Random.new(4617)
-    for index = 1, CONFIG.THEME_STARS do
+    local random = Random.new(7319)
+    for index = 1, math.max(CONFIG.THEME_STARS, 12) do
         local dot = make("Frame", {
             Name = "Star" .. index, BorderSizePixel = 0, Active = false, ZIndex = 1,
-            Position = UDim2.fromScale(random:NextNumber(0.04, 0.96), random:NextNumber(0.06, 0.97)),
-            BackgroundColor3 = (index % 5 == 0) and THEME.cyan or (index % 3 == 0) and THEME.accentHot
-                or Color3.fromRGB(226, 220, 255),
+            Position = UDim2.fromScale(random:NextNumber(0.03, 0.97), random:NextNumber(0.10, 0.96)),
+            BackgroundColor3 = (index % 7 == 0) and THEME.cyan or (index % 3 == 0) and THEME.accentHot
+                or Color3.fromRGB(232, 226, 255),
         }, starfield)
         local dotSize = random:NextInteger(2, 3)
         dot.Size = UDim2.fromOffset(dotSize, dotSize)
-        dot.BackgroundTransparency = random:NextNumber(0.35, 0.7)
-        corner(4, dot)
+        dot.BackgroundTransparency = random:NextNumber(0.30, 0.62)
+        corner(999, dot)
         local tween = TweenService:Create(dot, TweenInfo.new(
-            random:NextNumber(1.8, 3.6), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
+            random:NextNumber(1.4, 3.4), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
         ), {
-            BackgroundTransparency = 0.9,
+            BackgroundTransparency = 0.88,
             Size = UDim2.fromOffset(dotSize + 1, dotSize + 1),
         })
         tween:Play()
         starTweens[#starTweens + 1] = tween
     end
+    for index, spec in ipairs({ { 132, THEME.accent, 0.94 }, { 96, THEME.cyan, 0.95 }, { 72, THEME.accentHot, 0.95 } }) do
+        local nebula = make("Frame", {
+            Name = "Nebula" .. index, BorderSizePixel = 0, Active = false, ZIndex = 1,
+            Position = UDim2.fromScale(random:NextNumber(0.08, 0.78), random:NextNumber(0.14, 0.70)),
+            Size = UDim2.fromOffset(spec[1], spec[1]), BackgroundColor3 = spec[2],
+            BackgroundTransparency = spec[3],
+        }, starfield)
+        corner(999, nebula)
+        local breathe = TweenService:Create(nebula, TweenInfo.new(4 + index, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+            BackgroundTransparency = math.min(0.985, spec[3] + 0.03),
+        })
+        breathe:Play()
+        starTweens[#starTweens + 1] = breathe
+    end
 end
 
 -- header ----------------------------------------------------------------------
-local HEADER_H = 50
+local HEADER_H = 52
 local header = make("Frame", {
     Name = "Header", Position = UDim2.fromOffset(1, 1), Size = UDim2.new(1, -2, 0, HEADER_H),
-    BackgroundColor3 = THEME.bgDeep, BackgroundTransparency = 0.1, BorderSizePixel = 0, ZIndex = 12,
+    BackgroundColor3 = THEME.bgDeep, BackgroundTransparency = 0.12, BorderSizePixel = 0, ZIndex = 12,
 }, panel)
-corner(14, header)
+corner(12, header)
+make("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(130, 118, 170)) }, header)
 
-local title = label(panel, "M0x46 FINDER", UDim2.fromOffset(14, 7), UDim2.new(1, -110, 0, 22), THEME.text, 17)
+local title = label(panel, "M0x46 FINDER", UDim2.fromOffset(16, 8), UDim2.new(1, -118, 0, 24), THEME.text, 18)
 title.Font = Enum.Font.GothamBlack
 title.ZIndex = 13
 make("UIGradient", {
     Rotation = 0,
     Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(198, 164, 255)),
 }, title)
+stroke(title, Color3.fromRGB(5, 3, 12), 1.4, 0.35)
 
-local statusText = label(panel, "starting…", UDim2.fromOffset(14, 29), UDim2.new(1, -110, 0, 15), THEME.cyan, 10)
+local statusText = label(panel, "connecting…", UDim2.fromOffset(16, 31), UDim2.new(1, -118, 0, 15), THEME.cyan, 10)
 statusText.ZIndex = 13
+statusText.Font = Enum.Font.Gotham
 
 local minimizeButton = button(panel, {
-    Name = "Minimize", Text = "—", Position = UDim2.new(1, -76, 0, 12),
-    Size = UDim2.fromOffset(28, 26), TextSize = 14, CornerRadius = 8, ZIndex = 14,
+    Name = "Minimize", Text = "—", Position = UDim2.new(1, -78, 0, 13),
+    Size = UDim2.fromOffset(30, 28), TextSize = 15, CornerRadius = 8, ZIndex = 14,
 }, false)
 local closeButton = button(panel, {
-    Name = "Close", Text = "✕", Position = UDim2.new(1, -44, 0, 12),
-    Size = UDim2.fromOffset(28, 26), TextSize = 12, CornerRadius = 8, ZIndex = 14,
+    Name = "Close", Text = "✕", Position = UDim2.new(1, -44, 0, 13),
+    Size = UDim2.fromOffset(30, 28), TextSize = 12, CornerRadius = 8, ZIndex = 14,
 }, false)
 closeButton.TextColor3 = THEME.red
+closeButton.BackgroundColor3 = Color3.fromRGB(120, 34, 44)
+closeButton.BackgroundTransparency = 0.35
 
 local hairline = make("Frame", {
     Name = "Hairline", BorderSizePixel = 0, Active = false, BackgroundColor3 = THEME.accent,
@@ -867,83 +920,93 @@ make("UIGradient", { Rotation = 0, Transparency = NumberSequence.new({
     NumberSequenceKeypoint.new(0.85, 0.2), NumberSequenceKeypoint.new(1, 1),
 })}, hairline)
 
--- tabs ------------------------------------------------------------------------
-local TABS_Y = HEADER_H + 8
+-- filter row: rarity chip + REFRESH (with the reset countdown inside it) ---------
+local CONTROLS_Y = HEADER_H + 8
+local filterButton = button(panel, {
+    Name = "RarityFilter", Text = "RARITY: ANY",
+    Position = UDim2.fromOffset(10, CONTROLS_Y), Size = UDim2.new(0.56, -14, 0, 32),
+    TextSize = 11, CornerRadius = 8,
+}, false)
+
+local refreshButton = button(panel, {
+    Name = "Refresh", Text = "REFRESH",
+    Position = UDim2.new(0.56, -2, 0, CONTROLS_Y), Size = UDim2.new(0.44, -10, 0, 32),
+    TextSize = 11, CornerRadius = 8, ZIndex = 14,
+}, false)
+refreshButton.BackgroundColor3 = Color3.fromRGB(104, 34, 196)
+stroke(refreshButton, THEME.accentHot, 1.5, 0.1)
+local resetLabel = make("TextLabel", {
+    Name = "Reset", Text = "--:--",
+    Position = UDim2.new(1, -86, 0, 0), Size = UDim2.fromOffset(80, 32),
+    BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 11,
+    TextColor3 = THEME.muted, TextXAlignment = Enum.TextXAlignment.Right,
+    ZIndex = 15, TextTruncate = Enum.TextTruncate.AtEnd,
+}, refreshButton)
+resetLabel.Text = "--:--"
+
+-- bottom tab bar (MY SERVER / ALL SERVERS), like the reference ------------------
+local TABS_H = 36
+local FOOTER_BTN_H = 30
 local tabBar = make("Frame", {
-    Name = "Tabs", Position = UDim2.fromOffset(10, TABS_Y), Size = UDim2.new(1, -20, 0, 32),
+    Name = "Tabs", Position = UDim2.new(0, 10, 1, -(FOOTER_BTN_H + 6 + TABS_H + 8)),
+    Size = UDim2.new(1, -20, 0, TABS_H),
     BackgroundTransparency = 1, ZIndex = 12,
 }, panel)
 make("UIListLayout", {
     FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
     SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center,
 }, tabBar)
-
 local localTab = button(tabBar, {
-    Name = "TabLocal", Text = "MY SERVER", Size = UDim2.new(0.5, -3, 0, 30),
-    LayoutOrder = 1, TextSize = 11, CornerRadius = 8,
+    Name = "TabLocal", Text = "MY SERVER", Size = UDim2.new(0.5, -3, 1, 0),
+    LayoutOrder = 1, TextSize = 12, CornerRadius = 8,
 }, true)
 local feedTab = button(tabBar, {
-    Name = "TabAll", Text = "ALL SERVERS", Size = UDim2.new(0.5, -3, 0, 30),
-    LayoutOrder = 2, TextSize = 11, CornerRadius = 8,
+    Name = "TabAll", Text = "ALL SERVERS", Size = UDim2.new(0.5, -3, 1, 0),
+    LayoutOrder = 2, TextSize = 12, CornerRadius = 8,
 }, false)
-
--- filter row ------------------------------------------------------------------
-local FILTER_Y = TABS_Y + 38
-local filterButton = button(panel, {
-    Name = "RarityFilter", Text = "RARITY: ANY",
-    Position = UDim2.fromOffset(10, FILTER_Y), Size = UDim2.new(0.52, -12, 0, 30),
-    TextSize = 11, CornerRadius = 8,
-}, false)
-
-local refreshButton = button(panel, {
-    Name = "Refresh", Text = "REFRESH",
-    Position = UDim2.new(0.52, 0, 0, FILTER_Y), Size = UDim2.new(0.24, -4, 0, 30),
-    TextSize = 11, CornerRadius = 8,
-}, false)
-
-local resetLabel = make("TextLabel", {
-    Name = "Reset",
-    Text = "--:--", Position = UDim2.new(0.76, 4, 0, FILTER_Y), Size = UDim2.new(0.24, -14, 0, 30),
-    BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 11,
-    TextColor3 = THEME.muted, TextXAlignment = Enum.TextXAlignment.Right,
-    TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5,
-}, panel)
 
 -- list ------------------------------------------------------------------------
-local LIST_Y = FILTER_Y + 36
-local LIST_FOOTER = 76   -- footer (30) + hint (18) + margins
+local LIST_Y = CONTROLS_Y + 38
+local HINT_H = 16
+-- everything the list must leave room for at the bottom
+-- takes the panel height as an argument: panelH is declared below, and an
+-- unresolved upvalue would silently become a nil global
+local function listInset(height)
+    local hint = height >= 430 and HINT_H or 0
+    return FOOTER_BTN_H + 6 + TABS_H + 8 + hint
+end
 local list = make("ScrollingFrame", {
     Name = "List", Position = UDim2.fromOffset(10, LIST_Y),
-    Size = UDim2.new(1, -20, 1, -(LIST_Y + LIST_FOOTER)),
+    Size = UDim2.new(1, -20, 0, 300),
     BackgroundTransparency = 1, BorderSizePixel = 0,
     CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    ScrollBarThickness = 4, ScrollBarImageColor3 = THEME.accent, ScrollBarImageTransparency = 0.25,
+    ScrollBarThickness = 5, ScrollBarImageColor3 = Color3.fromRGB(150, 132, 190),
+    ScrollBarImageTransparency = 0.15,
     ScrollingDirection = Enum.ScrollingDirection.Y, ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
     ZIndex = 11,
 }, panel)
 make("UIListLayout", {
-    Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+    Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder,
     HorizontalAlignment = Enum.HorizontalAlignment.Left,
 }, list)
 make("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2) }, list)
 
 -- footer ----------------------------------------------------------------------
-local footerY = -66
 local broadcastButton = button(panel, {
     Name = "Broadcast", Text = "BROADCAST: ON",
-    Position = UDim2.new(0, 10, 1, footerY), Size = UDim2.new(0.5, -13, 0, 30),
-    TextSize = 11, CornerRadius = 8,
+    Position = UDim2.new(0, 10, 1, -(FOOTER_BTN_H + 8)), Size = UDim2.new(0.5, -13, 0, FOOTER_BTN_H),
+    TextSize = 10, CornerRadius = 8,
 }, false)
 local settingsButton = button(panel, {
     Name = "Settings", Text = "SETTINGS",
-    Position = UDim2.new(0.5, 3, 1, footerY), Size = UDim2.new(0.5, -13, 0, 30),
-    TextSize = 11, CornerRadius = 8,
+    Position = UDim2.new(0.5, 3, 1, -(FOOTER_BTN_H + 8)), Size = UDim2.new(0.5, -13, 0, FOOTER_BTN_H),
+    TextSize = 10, CornerRadius = 8,
 }, false)
 
 local footerHint = make("TextLabel", {
     Name = "FooterHint", Text = "SIGHTINGS SHARED WITH YOUR OWN SERVER",
-    Position = UDim2.new(0, 12, 1, -30), Size = UDim2.new(1, -24, 0, 16),
-    BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10,
+    Position = UDim2.new(0, 12, 1, -15), Size = UDim2.new(1, -24, 0, 12),
+    BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 9,
     TextColor3 = THEME.muted, TextXAlignment = Enum.TextXAlignment.Center,
     TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5,
 }, panel)
@@ -956,8 +1019,8 @@ local overlay = make("Frame", {
     BackgroundColor3 = THEME.bgDeep, BackgroundTransparency = 0.03, BorderSizePixel = 0,
     Visible = false, ZIndex = 30,
 }, panel)
-corner(14, overlay)
-stroke(overlay, THEME.accent, 1.2, 0.35)
+corner(12, overlay)
+stroke(overlay, THEME.accent, 1.4, 0.32)
 
 local overlayTitle = label(overlay, "SETTINGS", UDim2.fromOffset(16, 12), UDim2.new(1, -80, 0, 24), THEME.text, 16)
 overlayTitle.Font = Enum.Font.GothamBlack
@@ -988,7 +1051,6 @@ local function overRow(height, order)
     }, overlayBody)
 end
 
--- minimum income: text box + quick presets
 local rateRow = overRow(76, 1)
 local rateTitle = label(rateRow, "MINIMUM INCOME", UDim2.fromOffset(2, 0), UDim2.new(1, -4, 0, 16), THEME.muted, 10)
 rateTitle.Font = Enum.Font.GothamBold
@@ -1014,7 +1076,6 @@ end
 local rateHint = label(rateRow, "B/s — 0 or OFF shows every egg", UDim2.fromOffset(2, 54), UDim2.new(1, -4, 0, 14), THEME.muted, 9)
 rateHint.Font = Enum.Font.Gotham
 
--- toggles
 local broadcastToggle = button(overlayBody, {
     Name = "BroadcastToggle", Text = "BROADCAST: ON", Size = UDim2.new(1, -12, 0, 38),
     LayoutOrder = 2, TextSize = 11, CornerRadius = 9, ZIndex = 31,
@@ -1052,42 +1113,42 @@ end
 --==============================================================================
 -- RESPONSIVE LAYOUT + DRAG
 --==============================================================================
-local panelX, panelY = 16, 60
+local panelX, panelY = 18, 64
 local panelW, panelH = 404, 560
 
 local function clampPanel()
     local vw, vh = viewport()
-    panelW = clamp(panelW, 280, math.min(440, vw - 16))
-    panelH = clamp(panelH, 300, math.min(640, vh - MOBILE_TOPBAR - 16))
+    local maxH = math.max(220, vh - MOBILE_TOPBAR - SCREEN_MARGIN)
+    panelW = clamp(panelW, math.min(260, vw - 16), math.min(440, vw - 16))
+    panelH = clamp(panelH, math.min(260, maxH), math.min(640, maxH))
     panelX = clamp(panelX, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - panelW - SCREEN_MARGIN))
     panelY = clamp(panelY, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - panelH - SCREEN_MARGIN))
     panel.Size = UDim2.fromOffset(panelW, panelH)
     panel.Position = UDim2.fromOffset(panelX, panelY)
+    footerHint.Visible = panelH >= 430
+    list.Size = UDim2.new(1, -20, 0, math.max(40, panelH - LIST_Y - listInset(panelH)))
 end
 
 local function clampLauncher()
     local vw, vh = viewport()
     local position = launcher.Position
-    local x = clamp(position.X.Offset, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - 84 - SCREEN_MARGIN))
-    local y = clamp(position.Y.Offset, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - 40 - SCREEN_MARGIN))
+    local x = clamp(position.X.Offset, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - 62 - SCREEN_MARGIN))
+    local y = clamp(position.Y.Offset, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - 62 - SCREEN_MARGIN))
     launcher.Position = UDim2.fromOffset(x, y)
 end
 
--- list height drives card density: fewer rows on a phone, richer rows on a PC
+-- card height follows the panel so a phone still shows 3-4 real rows
 local function cardHeight()
     clampPanel()
-    local listHeight = panelH - (LIST_Y + LIST_FOOTER)
-    if listHeight <= 0 then return 96 end
-    local perCard = listHeight / 3.2
-    return math.floor(clamp(perCard - 6, 58, 104))
+    local listHeight = math.max(40, panelH - LIST_Y - listInset(panelH))
+    return math.floor(clamp(listHeight / 2.9 - 5, 62, 104))
 end
 
--- 4 rows on tall cards, 3 rows mid, 2 rows compact
 local function cardRows()
     local height = cardHeight()
-    if height >= 92 then return 4 end
-    if height >= 74 then return 3 end
-    return 2
+    if height >= 88 then return 3 end
+    if height >= 74 then return 2 end
+    return 1
 end
 
 local function applyLayout()
@@ -1096,7 +1157,6 @@ local function applyLayout()
     markDirty()
 end
 
--- drag (mouse + touch), clamped to the screen so nothing can leave the viewport
 do
     local dragging, dragTarget, startMouse, startOffset = false, nil, nil, nil
 
@@ -1121,8 +1181,8 @@ do
             and input.UserInputType ~= Enum.UserInputType.Touch then return end
         local delta = input.Position - startMouse
         local vw, vh = viewport()
-        local width = dragTarget == panel and panelW or 84
-        local height = dragTarget == panel and panelH or 40
+        local width = dragTarget == panel and panelW or 62
+        local height = dragTarget == panel and panelH or 62
         local x = clamp(startOffset.X.Offset + delta.X, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - width - SCREEN_MARGIN))
         local y = clamp(startOffset.Y.Offset + delta.Y, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - height - SCREEN_MARGIN))
         dragTarget.Position = UDim2.fromOffset(x, y)
@@ -1159,6 +1219,7 @@ local MUTATION_PALETTE = {
     rainbow = { Color3.fromRGB(255, 70, 90), Color3.fromRGB(255, 196, 60), Color3.fromRGB(86, 232, 140), Color3.fromRGB(76, 190, 255), Color3.fromRGB(186, 96, 255) },
     frozen = { Color3.fromRGB(150, 210, 255), Color3.fromRGB(226, 244, 255), Color3.fromRGB(120, 180, 240) },
     shadow = { Color3.fromRGB(96, 60, 160), Color3.fromRGB(40, 24, 70), Color3.fromRGB(150, 100, 220) },
+    discord = { Color3.fromRGB(255, 0, 225), Color3.fromRGB(161, 0, 255) },
 }
 
 local liveGradients = {}
@@ -1172,23 +1233,31 @@ local function colorSequence(palette)
     return ColorSequence.new(points)
 end
 
--- Adds a slowly scrolling gradient. Offset is tweened by the engine, so an
--- animated rainbow costs zero Lua cycles (this used to be a 0.25 s loop).
-local function paintMutation(object, mutationName)
-    local palette = MUTATION_PALETTE[tostring(mutationName):lower()]
-    if not palette then return end
-    if object:IsA("TextLabel") or object:IsA("TextButton") then
-        object.TextColor3 = Color3.new(1, 1, 1)
-    end
+-- Engine-tweened Offset: an animated rainbow costs zero Lua cycles.
+local function scrollGradient(object, palette, seconds)
     local gradient = make("UIGradient", {
-        Color = colorSequence(palette), Rotation = 0,
-        Offset = Vector2.new(0, 0),
+        Color = colorSequence(palette), Rotation = 0, Offset = Vector2.new(0, 0),
     }, object)
-    local tween = TweenService:Create(gradient, TweenInfo.new(2.6, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false), {
-        Offset = Vector2.new(1, 0),
-    })
+    local tween = TweenService:Create(gradient, TweenInfo.new(
+        seconds or 3.2, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false
+    ), { Offset = Vector2.new(1, 0) })
     tween:Play()
     liveGradients[gradient] = tween
+    return gradient
+end
+
+local function mutationPalette(mutationName)
+    return MUTATION_PALETTE[tostring(mutationName or ""):lower()]
+end
+
+local function paintMutation(object, mutationName)
+    local palette = mutationPalette(mutationName)
+    if not palette then return false end
+    if object:IsA("TextLabel") or object:IsA("TextButton") then
+        object.TextColor3 = Color3.new(1, 1, 1)
+        scrollGradient(object, palette, 2.6)
+    end
+    return true
 end
 
 local function clearGradients()
@@ -1200,7 +1269,36 @@ local function clearGradients()
 end
 
 --==============================================================================
--- CARD RENDERER
+-- JOIN  (implementation must sit ABOVE the card renderer: a `local function`
+--        referenced earlier resolves to a nil global and silently does nothing)
+--==============================================================================
+local function requestJoin(entry)
+    if not validJobId(entry.jobId) then
+        notify("no valid JobId for this egg", 5)
+        return false
+    end
+    local placeId = tonumber(entry.placeId) or game.PlaceId
+    notify("joining " .. shortId(entry.jobId) .. "…", 8)
+    -- advisory claim; failure must never block a join the user asked for
+    task.spawn(function()
+        pcall(function()
+            api("POST", "/v1/join", {
+                placeId = placeId, jobId = entry.jobId, uid = entry.uid, reporterId = reporterId,
+            })
+        end)
+    end)
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(placeId, entry.jobId, player)
+    end)
+    if not ok then
+        notify("teleport failed: " .. tostring(err), 8)
+        return false
+    end
+    return true
+end
+
+--==============================================================================
+-- CARD RENDERER  (icon | rank | name / rarity / income+weight / mutations | JOIN)
 --==============================================================================
 local function clearList()
     clearGradients()
@@ -1224,17 +1322,10 @@ local function serverLine(entry)
     return "SERVER " .. shortId(entry.jobId), false
 end
 
-local pendingJoins = {}   -- button -> { until_ = number, restore = string }
-
-local function makeRow(parent, order, height)
-    return make("Frame", {
-        Name = "Row" .. order, Size = UDim2.new(1, 0, 0, height),
-        BackgroundTransparency = 1, LayoutOrder = order, ZIndex = 12,
-    }, parent)
-end
-
--- Forward declaration: JOIN callbacks are created here, before its implementation.
-local requestJoin
+local SURE_COLOR = Color3.fromRGB(190, 132, 30)
+local JOIN_COLOR = Color3.fromRGB(40, 160, 85)
+local HERE_COLOR = Color3.fromRGB(86, 90, 100)
+local pendingJoins = {}
 
 local function makeCard(entry, index)
     local spec = raritySpec(entry)
@@ -1245,131 +1336,154 @@ local function makeCard(entry, index)
     local serverText, isHere = serverLine(entry)
 
     local card = make("Frame", {
-        Name = "Card" .. index, Size = UDim2.new(1, -4, 0, height),
-        BackgroundColor3 = THEME.glass, BackgroundTransparency = 0.06, BorderSizePixel = 0,
+        Name = "Card" .. index, Size = UDim2.new(1, -6, 0, height),
+        BackgroundColor3 = CARD_BG, BackgroundTransparency = 0.10, BorderSizePixel = 0,
         LayoutOrder = index, ZIndex = 11, ClipsDescendants = true,
     })
-    corner(10, card)
-    stroke(card, isHere and THEME.line or THEME.accent, 1, isHere and 0.55 or 0.42)
-    -- rarity tint on the left edge
+    corner(8, card)
+    make("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(168, 158, 200)) }, card)
+    stroke(card, isHere and THEME.line or THEME.accent, 1, isHere and 0.55 or 0.3)
+    bevel(card, 12)
+
+    -- left rarity tint bar
     local tint = make("Frame", {
-        Name = "Tint", Size = UDim2.new(0, 3, 1, -12), Position = UDim2.fromOffset(0, 6),
-        BackgroundColor3 = spec.color, BackgroundTransparency = 0.15, BorderSizePixel = 0, ZIndex = 12,
+        Name = "Tint", Size = UDim2.new(0, 3, 1, -10), Position = UDim2.fromOffset(0, 5),
+        BackgroundColor3 = spec.color, BackgroundTransparency = 0.12, BorderSizePixel = 0, ZIndex = 13,
     }, card)
     corner(2, tint)
 
-    local bodyWidth = 1
-    local body = make("Frame", {
-        Name = "Body", Position = UDim2.fromOffset(9, 5),
-        Size = UDim2.new(1, -(canJoin and 96 or 18), 1, -10),
-        BackgroundTransparency = 1, ZIndex = 12,
-    }, card)
-    make("UIListLayout", {
-        Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder,
-        HorizontalAlignment = Enum.HorizontalAlignment.Left,
-    }, body)
-
-    -- row 1: name + rarity chip
-    local row1 = makeRow(body, 1, 22)
-    local nameLabel = label(row1, tostring(entry.name), UDim2.new(), UDim2.new(1, -74, 0, 22), spec.color, rows >= 4 and 15 or 13)
-    nameLabel.Font = Enum.Font.GothamBlack
-    if rank >= 8 then
-        local gradient = make("UIGradient", { Color = colorSequence({ spec.color, THEME.text, spec.color }), Rotation = 0 }, nameLabel)
-        local tween = TweenService:Create(gradient, TweenInfo.new(3.4, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false), {
-            Offset = Vector2.new(1, 0),
-        })
-        tween:Play()
-        liveGradients[gradient] = tween
+    -- egg icon (only when the game gives us one)
+    local iconX = 9
+    local iconUrl = type(entry.icon) == "string" and entry.icon or nil
+    if iconUrl and #iconUrl > 0 then
+        local iconSize = math.min(56, height - 26)
+        local iconBack = make("Frame", {
+            Name = "IconBack", Position = UDim2.fromOffset(iconX, math.floor((height - iconSize) / 2)),
+            Size = UDim2.fromOffset(iconSize, iconSize), BackgroundColor3 = THEME.bgDeep,
+            BackgroundTransparency = 0.25, BorderSizePixel = 0, ZIndex = 12,
+        }, card)
+        corner(8, iconBack)
+        stroke(iconBack, spec.color, 1, 0.6)
+        local icon = make("ImageLabel", {
+            Name = "EggIcon", Image = iconUrl, BackgroundTransparency = 1, ZIndex = 13,
+            Position = UDim2.fromOffset(2, 2), Size = UDim2.new(1, -4, 1, -4), ScaleType = Enum.ScaleType.Fit,
+        }, iconBack)
+        local _ = icon
+        iconX = iconX + iconSize + 8
     end
+
+    -- rank
+    local rankLabel = label(card, "#" .. index, UDim2.fromOffset(iconX, 4), UDim2.fromOffset(34, 24),
+        Color3.fromRGB(220, 224, 235), math.min(20, math.max(14, height - 62)))
+    rankLabel.Font = Enum.Font.GothamBlack
+    rankLabel.ZIndex = 13
+    stroke(rankLabel, Color3.new(0, 0, 0), 1.4, 0.3)
+
+    -- name
+    -- number, not a boolean: `canJoin or isHere and 78 or 66` yields true
+    local joinW = canJoin and 78 or (isHere and 70 or 66)
+    local nameX = iconX + 32
+    local nameLabel = label(card, tostring(entry.name), UDim2.fromOffset(nameX, 3),
+        UDim2.new(1, -(nameX + joinW + 14), 0, 26), spec.color, math.min(18, math.max(13, height - 64)))
+    nameLabel.Font = Enum.Font.GothamBlack
+    nameLabel.ZIndex = 13
+    stroke(nameLabel, Color3.new(0, 0, 0), 1.1, 0.35)
+    local topPalette = nil
+    for _, mutation in ipairs(entry.mutations or {}) do
+        topPalette = topPalette or mutationPalette(mutation)
+    end
+    if topPalette then
+        nameLabel.TextColor3 = Color3.new(1, 1, 1)
+        scrollGradient(nameLabel, topPalette, 3.0)
+    elseif rank >= 8 then
+        scrollGradient(nameLabel, { spec.color, THEME.text, spec.color }, 3.4)
+    end
+
+    -- rarity chip
+    local chipY = height - 21
     local chip = make("TextLabel", {
-        Name = "Rarity",
-        Text = tostring(entry.rarity):upper(), Position = UDim2.new(1, -70, 0, 2),
-        Size = UDim2.fromOffset(70, 17), BackgroundColor3 = spec.color, BackgroundTransparency = 0.84,
-        BorderSizePixel = 0, Font = Enum.Font.GothamBold, TextSize = 9, TextColor3 = spec.color,
+        Name = "Rarity", Text = tostring(entry.rarity):upper(),
+        Position = UDim2.fromOffset(iconX + 30, chipY), Size = UDim2.fromOffset(76, 16),
+        BackgroundColor3 = spec.color, BackgroundTransparency = 0.88, BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold, TextSize = 9, TextColor3 = spec.color,
         TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 13,
-    }, row1)
+    }, card)
     corner(4, chip)
     stroke(chip, spec.color, 1, 0.5)
 
-    -- row 2: income + weight
-    local row2 = makeRow(body, 2, 20)
-    local income = label(row2, money(entry.rate), UDim2.new(), UDim2.fromOffset(140, 20), THEME.green, rows >= 4 and 15 or 13)
-    income.Font = Enum.Font.GothamBlack
-    income.Name = "Income"
+    -- income + weight
+    local moneyLabel = label(card, money(entry.rate), UDim2.fromOffset(iconX + 112, chipY - 1),
+        UDim2.fromOffset(110, 18), THEME.green, 15)
+    moneyLabel.Name = "Income"
+    moneyLabel.Font = Enum.Font.GothamBlack
+    moneyLabel.ZIndex = 13
     local weight = weightText(entry)
     if weight then
         local weightLabel = make("TextLabel", {
-            Name = "Weight", Text = weight, Position = UDim2.new(1, -110, 0, 0), Size = UDim2.fromOffset(110, 20),
-            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = THEME.muted,
-            TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 12,
-        }, row2)
-        weightLabel.Name = "Weight"
+            Name = "Weight", Text = weight, Position = UDim2.new(1, -(joinW + 116), 0, chipY),
+            Size = UDim2.fromOffset(104, 16), BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = THEME.muted,
+            TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 13,
+        }, card)
+        local _ = weightLabel
     end
 
-    -- row 3: mutations (only when the card is tall enough)
-    if rows >= 3 then
-        local row3 = makeRow(body, 3, 18)
+    -- mutations / server line
+    if rows >= 2 then
+        local flow = make("Frame", {
+            Name = "Mutations", Position = UDim2.fromOffset(nameX, 30),
+            Size = UDim2.new(1, -(nameX + joinW + 14), 0, 16), BackgroundTransparency = 1, ZIndex = 13,
+        }, card)
+        make("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5),
+            SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center,
+        }, flow)
         local mutations = entry.mutations or {}
         if #mutations == 0 then
             local none = make("TextLabel", {
-                Name = "MutNone", Text = "no mutation", Size = UDim2.fromOffset(110, 18), BackgroundTransparency = 1,
-                Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = THEME.muted, ZIndex = 12,
-            }, row3)
-            none.TextXAlignment = Enum.TextXAlignment.Left
-        else
-            local flow = make("Frame", {
-                Name = "Mutations", Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, ZIndex = 12,
-            }, row3)
-            make("UIListLayout", {
-                FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5),
-                SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center,
+                Name = "MutNone", Text = "no mutation", Size = UDim2.fromOffset(100, 16),
+                BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 9,
+                TextColor3 = THEME.muted, ZIndex = 13, LayoutOrder = 1,
             }, flow)
+            local _ = none
+        else
             for mutationIndex, mutation in ipairs(mutations) do
                 local word = make("TextLabel", {
                     Name = "Mut" .. mutationIndex, Text = tostring(mutation),
-                    Size = UDim2.fromOffset(math.min(#tostring(mutation) * 7 + 10, 120), 18),
+                    Size = UDim2.fromOffset(math.min(#tostring(mutation) * 7 + 8, 96), 16),
                     BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, TextSize = 10,
                     TextColor3 = THEME.text, TextTruncate = Enum.TextTruncate.AtEnd,
-                    LayoutOrder = mutationIndex, ZIndex = 13,
+                    LayoutOrder = mutationIndex, ZIndex = 14,
                 }, flow)
                 paintMutation(word, mutation)
             end
         end
+        if rows >= 3 then
+            local areaLabel = make("TextLabel", {
+                Name = "Area", Text = (entry.area and ("area " .. tostring(entry.area)) or "area unknown")
+                    .. "  ·  " .. serverText,
+                Position = UDim2.fromOffset(nameX, 48), Size = UDim2.new(1, -(nameX + joinW + 14), 0, 14),
+                BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 9,
+                TextColor3 = isHere and THEME.muted or THEME.cyan,
+                TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 13,
+            }, card)
+            local _ = areaLabel
+        end
     end
 
-    -- row 4: server / area
-    if rows >= 4 then
-        local row4 = makeRow(body, 4, 16)
-        local areaText = entry.area and ("area " .. tostring(entry.area)) or "area unknown"
-        local areaLabel = make("TextLabel", {
-            Name = "Area", Text = areaText, Size = UDim2.new(0.55, 0, 0, 16), BackgroundTransparency = 1,
-            Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = THEME.muted,
-            TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 12,
-        }, row4)
-        local serverLabel = make("TextLabel", {
-            Name = "Server", Text = serverText, Position = UDim2.new(0.55, 0, 0, 0), Size = UDim2.new(0.45, 0, 0, 16),
-            BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 9,
-            TextColor3 = isHere and THEME.muted or THEME.cyan,
-            TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 12,
-        }, row4)
-    end
+    -- action button
+    local buttonWidth = canJoin and 78 or (isHere and 70 or 66)
+    local buttonHeight = math.min(30, height - 32)
+    local action = button(card, {
+        Name = "JoinStatus", Text = isHere and "HERE" or (canJoin and "JOIN" or "NO ID"),
+        Position = UDim2.new(1, -(buttonWidth + 9), 0, math.floor((height - buttonHeight) / 2)),
+        Size = UDim2.fromOffset(buttonWidth, buttonHeight), TextSize = 11, CornerRadius = 8, ZIndex = 15,
+    }, false)
+    action.BackgroundColor3 = canJoin and JOIN_COLOR or HERE_COLOR
+    action.TextColor3 = canJoin and Color3.new(1, 1, 1) or THEME.muted
+    if canJoin then stroke(action, Color3.new(0, 0, 0), 2, 0.35) end
 
-    -- join / here button (absolutely positioned so the row layout stays clean)
-    local joinButton = button(card, {
-        Name = "JoinStatus", Text = isHere and "HERE" or "JOIN",
-        Position = UDim2.new(1, -84, 0, math.floor((height - 30) / 2)),
-        Size = UDim2.fromOffset(74, 30), TextSize = 10, CornerRadius = 8, ZIndex = 14,
-    }, canJoin)
-    if not canJoin then
-        joinButton.Text = isHere and "HERE" or "NO ID"
-        joinButton.BackgroundColor3 = THEME.glassHigh
-        joinButton.TextColor3 = THEME.muted
-    else
-        joinButton.BackgroundColor3 = Color3.fromRGB(38, 158, 92)
-        joinButton.TextColor3 = Color3.new(1, 1, 1)
-    end
-
-    joinButton.MouseButton1Click:Connect(function()
+    action.MouseButton1Click:Connect(function()
         if isHere then
             notify("you are already in this server", 3)
             return
@@ -1378,10 +1492,11 @@ local function makeCard(entry, index)
             notify("this report has no usable JobId — cannot join", 5)
             return
         end
-        local pending = pendingJoins[joinButton]
+        local pending = pendingJoins[action]
         if pending and os.clock() < pending.until_ then
-            pendingJoins[joinButton] = nil
-            joinButton.Text = "JOIN"
+            pendingJoins[action] = nil
+            action.Text = "JOIN"
+            action.BackgroundColor3 = JOIN_COLOR
             requestJoin(entry)
             return
         end
@@ -1389,18 +1504,13 @@ local function makeCard(entry, index)
             requestJoin(entry)
             return
         end
-        pendingJoins[joinButton] = { until_ = os.clock() + 5, }
-        joinButton.Text = "SURE?"
-        joinButton.BackgroundColor3 = ThemeAmberButton()
+        pendingJoins[action] = { until_ = os.clock() + 5 }
+        action.Text = "SURE?"
+        action.BackgroundColor3 = SURE_COLOR
         notify("tap JOIN again to teleport to " .. shortId(entry.jobId), 5)
     end)
 
     return card
-end
-
--- small helper kept out of the card body for readability
-function ThemeAmberButton()
-    return Color3.fromRGB(190, 132, 30)
 end
 
 --==============================================================================
@@ -1458,33 +1568,32 @@ end
 --==============================================================================
 local function render()
     clearList()
-    local shown, matched, total = visibleList()
+    local shown, matched = visibleList()
     if STATE.tab == "all" then STATE.feedMatched = matched end
 
     if #shown == 0 then
         local holder = make("Frame", {
-            Name = "EmptyState", Size = UDim2.new(1, -8, 0, 118), BackgroundColor3 = THEME.glass,
-            BackgroundTransparency = 0.35, BorderSizePixel = 0, LayoutOrder = 1, ZIndex = 11,
+            Name = "EmptyState", Size = UDim2.new(1, -6, 0, 122), BackgroundColor3 = CARD_BG,
+            BackgroundTransparency = 0.3, BorderSizePixel = 0, LayoutOrder = 1, ZIndex = 11,
         }, list)
-        corner(10, holder)
-        stroke(holder, THEME.line, 1, 0.55)
+        corner(8, holder)
+        stroke(holder, THEME.line, 1, 0.5)
         local message = make("TextLabel", {
             Name = "EmptyText", Text = emptyMessage(), Size = UDim2.new(1, -20, 1, -20),
             Position = UDim2.fromOffset(10, 10), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
             TextSize = 11, TextColor3 = THEME.muted, TextWrapped = true,
             TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 12,
         }, holder)
-        message.Name = "EmptyText"
+        local _ = message
         return
     end
 
     for index = 1, #shown do
         local card = makeCard(shown[index], index)
         card.Parent = list
-        -- subtle fade/slide in; tween on the engine side only
         card.BackgroundTransparency = 1
         TweenService:Create(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            BackgroundTransparency = 0.06,
+            BackgroundTransparency = 0.10,
         }):Play()
     end
 end
@@ -1517,6 +1626,7 @@ local function ingestScan()
     for _, entry in ipairs(entries) do if passesFilter(entry) then matched = matched + 1 end end
     STATE.status = string.format("%d egg(s) • %d shown • %s", #entries, matched,
         CAPS.moduleApi and "module api" or "attribute scan")
+    markDirty()
     pcall(function()
         gui:SetAttribute("M0x46Count", matched)
         gui:SetAttribute("M0x46Raw", #entries)
@@ -1586,34 +1696,6 @@ end
 local function refreshLocal()
     ingestScan()
     renderIfDirty()
-end
-
---==============================================================================
--- JOIN
---==============================================================================
-requestJoin = function(entry)
-    if not validJobId(entry.jobId) then
-        notify("no valid JobId for this egg", 5)
-        return false
-    end
-    local placeId = tonumber(entry.placeId) or game.PlaceId
-    notify("joining " .. shortId(entry.jobId) .. "…", 8)
-    -- advisory claim; failure must never block a join the user asked for
-    task.spawn(function()
-        pcall(function()
-            api("POST", "/v1/join", {
-                placeId = placeId, jobId = entry.jobId, uid = entry.uid, reporterId = reporterId,
-            })
-        end)
-    end)
-    local ok, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(placeId, entry.jobId, player)
-    end)
-    if not ok then
-        notify("teleport failed: " .. tostring(err), 8)
-        return false
-    end
-    return true
 end
 
 pcall(function()
@@ -1690,7 +1772,7 @@ refreshButton.MouseButton1Click:Connect(function()
     if STATE.tab == "all" then refreshFeed() end
     local shown, matched = visibleList()
     notify(string.format("%d egg(s) match (≥%s, %s+)", matched, moneyFilter(STATE.minRate), rarityName(STATE.minRank)), 4)
-    local _ = shown
+    local _ = shown -- kept for debugging in the console
 end)
 
 broadcastButton.MouseButton1Click:Connect(function()
@@ -1773,7 +1855,7 @@ local function fadePanel(target, visible)
         tween:Play()
     end
     launcher.Visible = not visible
-    local _ = target
+    if target then target.Visible = true end
 end
 
 local function openPanel()
@@ -1798,7 +1880,6 @@ launcher.MouseButton1Click:Connect(function()
 end)
 minimizeButton.MouseButton1Click:Connect(minimizePanel)
 closeButton.MouseButton1Click:Connect(closeScript)
-resetLabel:GetPropertyChangedSignal("Text"):Connect(function() end)
 
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
@@ -1843,7 +1924,7 @@ local function expirePendingJoins()
             pendingJoins[button] = nil
         elseif os.clock() >= pending.until_ then
             button.Text = "JOIN"
-            button.BackgroundColor3 = Color3.fromRGB(38, 158, 92)
+            button.BackgroundColor3 = JOIN_COLOR
             pendingJoins[button] = nil
         end
     end
