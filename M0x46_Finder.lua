@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-  M0x46 FINDER  ·  v2.3  ·  owner build
+  M0x46 FINDER  ·  v2.4  ·  owner build
 ================================================================================
   M0x46-owned mobile client with an authorised NYX shared-feed adapter.
   It has no third-party gate, validation worker, remote-code loader, or
@@ -53,7 +53,7 @@
 local CONFIG = {
     -- Your established X-Egg-Room backend remains the optional fallback.
     -- NYX is tried first; its separate credential is NEVER stored in this file.
-    ENDPOINT = "https://m0x46-xm0emjn7.back4.app", -- own backend, no trailing slash
+    ENDPOINT = "https://m0x46-iqjlgk34.back4.app", -- own backend, no trailing slash
     ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI", -- must equal your backend ROOM_KEY
 
     HOTKEY = Enum.KeyCode.RightControl,
@@ -75,9 +75,10 @@ local CONFIG = {
     FEED_LIMIT = 40,                      -- max rows fetched from the backend
 
     BROADCAST = true,                     -- upload sightings to your backend
-    AUTO_JOIN = false,                    -- false = JOIN asks "SURE?" first
+    AUTO_JOIN = false,                    -- OFF by default; only teleports after a claim allows it
+    AUTO_FORCE = false,                   -- OFF by default; explicit arming is required in the UI
     REMOTE_ONLY = true,                   -- ALL SERVERS hides your own server
-    FEED_PAGES = 3,                       -- pages x FEED_LIMIT rows per refresh
+    FEED_PAGES = 3,                       -- pages x FEED_LIMIT rows per own-backend refresh
 
     -- NYX shared feed (cross-server network, used with the owner's permission).
     -- No NYX endpoint or room key is stored here: both are read as runtime data
@@ -88,8 +89,10 @@ local CONFIG = {
         ENDPOINT = "",          -- "" = take it from CONFIG_URL
         ROOM_KEY = "",          -- "" = take it from CONFIG_URL (never commit one)
         TIER = "public",
-        PAGES = 2,              -- bounded nextOffset paging (NYX currently retains ~30 rows)
-        FALLBACK = true,        -- fall back to your own backend when NYX is down
+        PAGES = 2,              -- normal NYX page budget
+        MAX_PAGES = 5,          -- bounded extra pages when early pages are only unavailable
+        EXPAND_UNAVAILABLE = true,
+        FALLBACK = true,        -- fall back to your own backend when NYX is down/empty
     },
     THEME_STARS = 16,                     -- backdrop dots (0 disables)
 }
@@ -544,7 +547,8 @@ local function api(method, pathAndQuery, body)
 end
 
 local STATE = {
-    tab = "local",
+    tab = "all",        -- LIVE FEED is the first screen; MY SERVER remains one tap away
+    view = "logs",      -- sidebar: logs | history | users
     raw = {},            -- unfiltered field eggs from the last scan
     rawAt = 0,
     scanned = 0,         -- how many records the last scan produced
@@ -559,6 +563,12 @@ local STATE = {
     feedTotalAll = 0,    -- backend total before hiding your own server
     feedError = nil,     -- nil = never fetched, else friendly reason
     feedLoaded = false,
+    feedPages = 0,
+    feedExpired = 0,
+    statusCounts = { joinable = 0, taken = 0, full = 0, unknown = 0, expired = 0 },
+    history = {},
+    autoSeen = {},
+    networkOnline = false,
     minRate = CONFIG.MIN_RATE,
     minRank = CONFIG.MIN_RANK,
     filterIndex = 1,
@@ -615,6 +625,50 @@ local function sortByValue(a, b)
     return tostring(a.name) < tostring(b.name)
 end
 
+-- Status is evidence-based. Missing NYX flags, transport failures and an
+-- unavailable/expired claim are NEVER re-labelled TAKEN. A fresh feed rebuilds
+-- rows from the server, so a local claim result cannot permanently poison one.
+local STATUS = {}
+function STATUS.now()
+    return os.time() * 1000
+end
+function STATUS.of(entry, now)
+    if type(entry) ~= "table" then return "unknown" end
+    now = tonumber(now) or STATUS.now()
+    if tonumber(entry.expiresAt) and entry.expiresAt > 0 and entry.expiresAt <= now then
+        return "expired"
+    end
+    if entry.takenConfirmed == true or entry.taken == true or entry.claimStatus == "taken" then
+        return "taken"
+    end
+    if entry.full == true or entry.claimStatus == "full" then return "full" end
+    if entry.claimStatus == "expired" then return "expired" end
+    if entry.claimStatus == "unavailable" then return "unknown" end
+    if entry.unavailable == true then return "unknown" end
+    -- Joinable requires positive feed evidence that BOTH state flags were sent
+    -- and false. Own-backend rows without NYX-style flags deliberately remain
+    -- UNKNOWN until their own preflight says allowed.
+    if entry.hasTakenFlag and entry.hasFullFlag and not entry.taken and not entry.full then
+        return "joinable"
+    end
+    return "unknown"
+end
+function STATUS.rank(entry, now)
+    local state = STATUS.of(entry, now)
+    return state == "joinable" and 1 or state == "unknown" and 2
+        or state == "full" and 3 or state == "taken" and 4 or 5
+end
+function STATUS.count(entries, now)
+    local counts = { joinable = 0, taken = 0, full = 0, unknown = 0, expired = 0 }
+    for _, entry in ipairs(entries or {}) do
+        if passesFilter(entry) then
+            local state = STATUS.of(entry, now)
+            counts[state] = (counts[state] or 0) + 1
+        end
+    end
+    return counts
+end
+
 -- visible rows for the current tab. Never mutates STATE.raw / STATE.feed.
 local function visibleList()
     local source = STATE.tab == "local" and STATE.raw or STATE.feed
@@ -623,12 +677,11 @@ local function visibleList()
         if passesFilter(entry) then matched[#matched + 1] = entry end
     end
     if STATE.tab == "all" then
-        -- Put usable opportunities ahead of historical FULL/TAKEN reports.
-        -- The latter remain visible (they are real), but cannot steal focus.
+        -- JOINABLE first, then UNKNOWN (preflight still possible), then
+        -- confirmed FULL/TAKEN. This is a status sort, never a guess.
         table.sort(matched, function(a, b)
-            local aDead = (a.taken == true or a.full == true) and 1 or 0
-            local bDead = (b.taken == true or b.full == true) and 1 or 0
-            if aDead ~= bDead then return aDead < bDead end
+            local ar, br = STATUS.rank(a), STATUS.rank(b)
+            if ar ~= br then return ar < br end
             return sortByValue(a, b)
         end)
     else
@@ -753,15 +806,21 @@ local function normalizeFeedItem(item, feedSource)
         jobId = jobId,
         placeId = tonumber(item.placeId) or game.PlaceId,
         isLocal = item.isLocal == true or (jobId ~= nil and jobId == game.JobId),
-        seenAt = tonumber(item.seenAt),
+        seenAt = tonumber(item.seenAt or item.updatedAt or item.reportedAt or item.createdAt),
         icon = type(item.icon) == "string" and item.icon:match("^rbxassetid://%d+$") and item.icon or nil,
         -- Transport provenance, not the reporter's own "source" field.  JOIN
         -- must claim against the network that actually served this row.
         source = feedSource or item.feedSource or "own",
         reportSource = item.source and tostring(item.source) or nil,
-        -- remote-feed health flags (NYX publishes these and they matter for JOIN)
+        -- Preserve raw NYX evidence separately. Missing is not false: missing
+        -- status information renders UNKNOWN, not a fake JOIN or fake TAKEN.
+        takenConfirmed = item.takenConfirmed == true,
+        taken = item.taken == true,
         full = item.full == true,
-        taken = item.takenConfirmed == true,
+        unavailable = item.unavailable == true,
+        hasTakenFlag = type(item.takenConfirmed) == "boolean" or type(item.taken) == "boolean",
+        hasFullFlag = type(item.full) == "boolean",
+        hasUnavailableFlag = type(item.unavailable) == "boolean",
         expiresAt = tonumber(item.expiresAt),
     }
 end
@@ -905,29 +964,29 @@ function NYX.claim(entry)
     return data
 end
 
--- Turn either network's claim payload into the one UI contract used by JOIN.
--- NYX deliberately uses HTTP 200 for a refusal, so `allowed` is authoritative.
+-- Turn either source's claim payload into an evidence-based result.
+-- `allowed=false, unavailable=true, takenConfirmed=false` is a stale/expired
+-- report, NOT proof that the egg was taken. NYX deliberately uses HTTP 200 for
+-- this response, so the body is authoritative.
 function NYX.claimVerdict(data)
-    if type(data) ~= "table" then return "the claim response was invalid" end
-    if data.allowed == true then return "ok" end
-    -- Explicit unavailability wins over a generic `ok` flag if a service sends
-    -- both: never teleport on an already-known refusal.
-    if data.unavailable or data.expired then
-        return "expired or already claimed — tap REFRESH for a fresh list"
+    if type(data) ~= "table" then return "unknown", "claim returned invalid data" end
+    if data.allowed == true then return "allowed", "claim accepted" end
+    if data.takenConfirmed == true or data.taken == true then
+        return "taken", "NYX confirmed this egg was taken"
     end
-    if data.takenConfirmed or data.taken then return "that egg was already taken" end
-    if data.full then return "that server is full" end
-    if data.ok == true and data.allowed == nil and not data.error and not data.reason then
-        return "ok"
-    end
-    local reason = tostring(data.error or data.reason or "the network refused this join")
+    if data.full == true then return "full", "NYX confirmed that server is full" end
+    local reason = tostring(data.error or data.reason or "claim was not allowed")
     local lower = reason:lower()
-    if lower:find("full", 1, true) then return "that server is full" end
-    if lower:find("expired", 1, true) or lower:find("taken", 1, true)
-        or lower:find("claim", 1, true) or lower:find("unavailable", 1, true) then
-        return "expired or already claimed — tap REFRESH for a fresh list"
+    if data.expired == true or lower:find("expired", 1, true) then
+        return "expired", reason
     end
-    return reason
+    if data.unavailable == true or lower:find("no longer available", 1, true) then
+        -- `unavailable` is a distinct current claim result, not proof of TAKEN
+        -- and not proof that the feed's expiresAt elapsed.
+        return "unavailable", reason
+    end
+    -- A generic refusal is still not TAKEN unless NYX supplied a confirming flag.
+    return "unknown", reason
 end
 
 -- nowMs(): NYX publishes its own serverTime. Teleporting to another server does
@@ -939,6 +998,17 @@ function NYX.now()
         return NYX.serverTime + (os.clock() - NYX.serverClock) * 1000
     end
     return os.time() * 1000
+end
+
+-- Continue beyond the normal page budget only when all reports seen so far are
+-- confirmed unavailable. UNKNOWN remains actionable because a preflight can
+-- still settle it, so it does not trigger wasteful extra pages.
+function NYX.hasActionable(entries)
+    for _, entry in ipairs(entries or {}) do
+        local state = STATUS.of(entry, NYX.now())
+        if state == "joinable" or state == "unknown" then return true end
+    end
+    return false
 end
 
 -- One boot probe that classifies the endpoint instead of only checking the path:
@@ -999,25 +1069,27 @@ local function probeApiBase()
 end
 
 --==============================================================================
--- THEME  (glass premium: deep purple, neon accents, soft bevels)
+-- ORIGINAL M0x46 RED/BLACK MOBILE UI
+-- Visual reference: compact neon operations console. This is an original layout
+-- and keeps M0x46's feed/auth/data pipeline; it imports no third-party assets.
 --==============================================================================
 local THEME = {
-    bg = Color3.fromRGB(10, 7, 22),
-    bgDeep = Color3.fromRGB(5, 3, 14),
-    glass = Color3.fromRGB(26, 18, 46),
-    glassHigh = Color3.fromRGB(40, 28, 68),
-    line = Color3.fromRGB(110, 80, 185),
-    accent = Color3.fromRGB(147, 92, 255),
-    accentHot = Color3.fromRGB(213, 96, 255),
-    cyan = Color3.fromRGB(56, 205, 255),
-    text = Color3.fromRGB(245, 240, 255),
-    muted = Color3.fromRGB(176, 162, 210),
-    green = Color3.fromRGB(96, 235, 150),
-    red = Color3.fromRGB(238, 96, 106),
-    amber = Color3.fromRGB(255, 202, 92),
-    tabActive = Color3.fromRGB(96, 58, 170),
+    bg = Color3.fromRGB(5, 5, 7),
+    panel = Color3.fromRGB(13, 10, 12),
+    panelHigh = Color3.fromRGB(25, 14, 17),
+    panelLow = Color3.fromRGB(8, 7, 8),
+    red = Color3.fromRGB(235, 29, 47),
+    redHot = Color3.fromRGB(255, 71, 71),
+    redDeep = Color3.fromRGB(116, 11, 21),
+    line = Color3.fromRGB(104, 26, 33),
+    text = Color3.fromRGB(248, 244, 244),
+    muted = Color3.fromRGB(176, 157, 160),
+    green = Color3.fromRGB(76, 239, 129),
+    amber = Color3.fromRGB(255, 190, 68),
+    blue = Color3.fromRGB(88, 194, 255),
+    gray = Color3.fromRGB(92, 92, 98),
 }
-local CARD_BG = Color3.fromRGB(26, 18, 46)
+local CARD_BG = Color3.fromRGB(15, 12, 14)
 
 local function make(class, props, parent)
     local object = Instance.new(class)
@@ -1030,587 +1102,365 @@ local function corner(radius, parent)
     return make("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
 end
 
-local function stroke(parent, color, thickness, transparency, gradientTo)
-    local object = make("UIStroke", {
+local function stroke(parent, color, thickness, transparency)
+    return make("UIStroke", {
         Color = color or THEME.line, Thickness = thickness or 1,
-        Transparency = transparency or 0.3, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Transparency = transparency == nil and 0.25 or transparency,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
     }, parent)
-    if gradientTo then
-        make("UIGradient", { Rotation = 55, Color = ColorSequence.new(color, gradientTo) }, object)
-    end
-    return object
 end
 
 local function label(parent, text, position, size, color, textSize)
     return make("TextLabel", {
-        Text = text, Position = position, Size = size, BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold, TextSize = textSize or 12,
+        Text = text or "", Position = position or UDim2.new(), Size = size or UDim2.new(),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = textSize or 12,
         TextColor3 = color or THEME.text, TextXAlignment = Enum.TextXAlignment.Left,
         TextTruncate = Enum.TextTruncate.AtEnd,
     }, parent)
 end
 
 local function button(parent, props, accent)
-    -- CornerRadius is a helper option, not a TextButton property.
-    -- Applying it via make() would throw before the launcher could appear.
     local radius = props.CornerRadius or 8
-    local buttonProps = {}
-    for key, value in pairs(props or {}) do
-        if key ~= "CornerRadius" then buttonProps[key] = value end
-    end
-    local object = make("TextButton", buttonProps, parent)
-    corner(radius, object)
-    object.BackgroundColor3 = accent and THEME.accent or THEME.glass
-    object.BackgroundTransparency = accent and 0.05 or 0.12
+    local data = {}
+    for key, value in pairs(props or {}) do if key ~= "CornerRadius" then data[key] = value end end
+    local object = make("TextButton", data, parent)
+    object.BackgroundColor3 = accent and THEME.redDeep or THEME.panelHigh
+    object.BackgroundTransparency = accent and 0.04 or 0.08
     object.TextColor3 = THEME.text
     object.Font = Enum.Font.GothamBold
-    object.TextSize = props.TextSize or 12
+    object.TextSize = props.TextSize or 11
     object.BorderSizePixel = 0
     object.AutoButtonColor = false
-    stroke(object, accent and THEME.accentHot or THEME.line, 1, accent and 0.35 or 0.45)
+    corner(radius, object)
+    stroke(object, accent and THEME.redHot or THEME.line, accent and 1.5 or 1, accent and 0.12 or 0.32)
     return object
 end
 
--- thin bevel lines: the "molded plastic" edge the reference cards have
-local function bevel(parent, zIndex)
-    make("Frame", {
-        Name = "BevelTop", Position = UDim2.fromOffset(3, 1), Size = UDim2.new(1, -6, 0, 1),
-        BackgroundColor3 = Color3.fromRGB(235, 230, 255), BackgroundTransparency = 0.62,
-        BorderSizePixel = 0, Active = false, ZIndex = zIndex or 12,
-    }, parent)
-    make("Frame", {
-        Name = "BevelBottom", Position = UDim2.new(0, 3, 1, -2), Size = UDim2.new(1, -6, 0, 1),
-        BackgroundColor3 = Color3.fromRGB(6, 3, 14), BackgroundTransparency = 0.1,
-        BorderSizePixel = 0, Active = false, ZIndex = zIndex or 12,
-    }, parent)
-end
-
 --==============================================================================
--- ROOT GUI
+-- ROOT GUI AND CONTROLS
 --==============================================================================
+local UI = {}
 local oldGui = playerGui:FindFirstChild("M0x46Finder")
 if oldGui then oldGui:Destroy() end
-
-local gui = make("ScreenGui", {
-    Name = "M0x46Finder",
-    ResetOnSpawn = false,
-    IgnoreGuiInset = true,
-    DisplayOrder = 1200,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+UI.gui = make("ScreenGui", {
+    Name = "M0x46Finder", ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 1200, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, playerGui)
-pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)
+pcall(function() UI.gui.ScreenInsets = Enum.ScreenInsets.None end)
 
 local function viewport()
     local ok, camera = pcall(function() return workspace.CurrentCamera end)
     local size = ok and camera and camera.ViewportSize
-    -- Roblox ViewportSize is a Vector2, not a Lua table.
-    if size and size.X and size.Y and size.X > 0 and size.Y > 0 then
-        return size.X, size.Y
-    end
+    if size and size.X and size.Y and size.X > 0 and size.Y > 0 then return size.X, size.Y end
     return 1280, 720
 end
 
 local MOBILE_TOPBAR, SCREEN_MARGIN = 44, 8
+UI.panelX, UI.panelY, UI.panelW, UI.panelH = 18, 64, 780, 520
 
---==============================================================================
--- LAUNCHER  (circular ring, like the reference's floating icon)
---==============================================================================
-local launcher = make("TextButton", {
-    Name = "Launcher", Text = "M0x46", Position = UDim2.new(0, 18, 0.5, -31),
-    Size = UDim2.fromOffset(62, 62), BackgroundColor3 = THEME.accent,
+UI.launcher = make("TextButton", {
+    Name = "Launcher", Text = "M0x46", Position = UDim2.fromOffset(18, 120),
+    Size = UDim2.fromOffset(60, 60), BackgroundColor3 = THEME.redDeep,
     BorderSizePixel = 0, AutoButtonColor = false, ZIndex = 40,
-    Font = Enum.Font.GothamBlack, TextSize = 13, TextColor3 = Color3.new(1, 1, 1),
-    TextTruncate = Enum.TextTruncate.AtEnd,
-}, gui)
-corner(999, launcher)
-make("UIGradient", { Rotation = 35, Color = ColorSequence.new(THEME.accent, THEME.accentHot) }, launcher)
-stroke(launcher, THEME.cyan, 2, 0.1)
-make("Frame", {
-    Name = "InnerRing", Position = UDim2.new(0, 5, 0, 5), Size = UDim2.new(1, -10, 1, -10),
-    BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 41,
-}, launcher)
-corner(999, launcher:FindFirstChild("InnerRing"))
-stroke(launcher:FindFirstChild("InnerRing"), Color3.fromRGB(255, 255, 255), 1, 0.7)
-local launcherDot = make("Frame", {
-    Name = "Live", Size = UDim2.fromOffset(9, 9), Position = UDim2.new(1, -13, 0, 8),
-    BackgroundColor3 = THEME.green, BorderSizePixel = 0, ZIndex = 43,
-}, launcher)
-corner(999, launcherDot)
-stroke(launcherDot, Color3.fromRGB(10, 7, 22), 2, 0.2)
+    Font = Enum.Font.GothamBlack, TextSize = 13, TextColor3 = THEME.text,
+}, UI.gui)
+corner(999, UI.launcher)
+stroke(UI.launcher, THEME.redHot, 2, 0.05)
+make("UIGradient", { Rotation = 45, Color = ColorSequence.new(THEME.redDeep, THEME.red) }, UI.launcher)
+UI.launcherDot = make("Frame", {
+    Name = "Live", Position = UDim2.new(1, -14, 0, 7), Size = UDim2.fromOffset(9, 9),
+    BackgroundColor3 = THEME.green, BorderSizePixel = 0, ZIndex = 42,
+}, UI.launcher)
+corner(999, UI.launcherDot)
+stroke(UI.launcherDot, THEME.bg, 2, 0.1)
 
---==============================================================================
--- PANEL SHELL
---==============================================================================
-local panel = make("Frame", {
-    Name = "Panel", Size = UDim2.fromOffset(404, 560),
-    Position = UDim2.new(0, 18, 0, 64),
-    BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.04, BorderSizePixel = 0,
-    Active = true, Visible = false, ClipsDescendants = true, ZIndex = 10,
-}, gui)
-corner(12, panel)
-stroke(panel, THEME.accent, 1.5, 0.22, THEME.cyan)
-make("UIGradient", {
-    Rotation = 95,
-    Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(150, 138, 190)),
-}, panel)
+UI.panel = make("Frame", {
+    Name = "Panel", Position = UDim2.fromOffset(UI.panelX, UI.panelY),
+    Size = UDim2.fromOffset(UI.panelW, UI.panelH), BackgroundColor3 = THEME.bg,
+    BorderSizePixel = 0, Active = true, Visible = false, ClipsDescendants = true, ZIndex = 10,
+}, UI.gui)
+corner(12, UI.panel)
+stroke(UI.panel, THEME.red, 2, 0.08)
+make("UIGradient", { Rotation = 90, Color = ColorSequence.new(THEME.panel, THEME.bg) }, UI.panel)
+UI.panelScale = make("UIScale", { Scale = 1 }, UI.panel)
 
--- soft outer glow ring
-local edgeGlow = make("Frame", {
-    Name = "EdgeGlow", BackgroundTransparency = 1, BorderSizePixel = 0,
-    Position = UDim2.fromOffset(-4, -4), Size = UDim2.new(1, 8, 1, 8), Active = false, ZIndex = 9,
-}, panel)
-corner(16, edgeGlow)
-stroke(edgeGlow, THEME.accent, 6, 0.84)
+-- Original red framing, deliberately lightweight: no RenderStepped or looping FX.
+local edge = make("Frame", {
+    Name = "RedEdge", Position = UDim2.fromOffset(0, 0), Size = UDim2.new(1, 0, 1, 0),
+    BackgroundTransparency = 1, BorderSizePixel = 0, Active = false, ZIndex = 11,
+}, UI.panel)
+corner(12, edge)
+stroke(edge, THEME.redHot, 5, 0.78)
+UI.sidebar = make("Frame", {
+    Name = "Sidebar", BackgroundColor3 = THEME.panelLow, BorderSizePixel = 0, ZIndex = 12,
+}, UI.panel)
+stroke(UI.sidebar, THEME.line, 1, 0.18)
+UI.brand = label(UI.sidebar, "M0x46\nFINDER", UDim2.fromOffset(10, 9), UDim2.new(1, -20, 0, 36), THEME.text, 15)
+UI.brand.Font = Enum.Font.GothamBlack
+UI.connectionDot = make("Frame", {
+    Name = "ConnectionDot", BackgroundColor3 = THEME.amber, BorderSizePixel = 0, ZIndex = 14,
+}, UI.sidebar)
+corner(999, UI.connectionDot)
+UI.connectionLabel = label(UI.sidebar, "CHECKING", UDim2.new(), UDim2.new(), THEME.muted, 9)
+UI.connectionLabel.ZIndex = 14
 
-local panelScale = make("UIScale", { Scale = 1 }, panel)
+UI.logsButton = button(UI.sidebar, { Name = "NavLogs", Text = "◉  LOGS", TextXAlignment = Enum.TextXAlignment.Left, CornerRadius = 8, ZIndex = 14 }, true)
+UI.historyButton = button(UI.sidebar, { Name = "NavHistory", Text = "◷  HISTORY", TextXAlignment = Enum.TextXAlignment.Left, CornerRadius = 8, ZIndex = 14 }, false)
+UI.settingsButton = button(UI.sidebar, { Name = "Settings", Text = "⚙  SETTINGS", TextXAlignment = Enum.TextXAlignment.Left, CornerRadius = 8, ZIndex = 14 }, false)
+UI.usersButton = button(UI.sidebar, { Name = "NavUsers", Text = "◌  USERS", TextXAlignment = Enum.TextXAlignment.Left, CornerRadius = 8, ZIndex = 14 }, false)
+UI.hideButton = button(UI.sidebar, { Name = "Minimize", Text = "✕  HIDE", CornerRadius = 8, ZIndex = 14 }, true)
 
--- backdrop: dots + three breathing nebulas (engine tweens only)
-local starfield = make("Frame", {
-    Name = "Starfield", BackgroundTransparency = 1, BorderSizePixel = 0,
-    Size = UDim2.fromScale(1, 1), Active = false, ZIndex = 1,
-}, panel)
-local starTweens = {}
-do
-    local random = Random.new(7319)
-    for index = 1, math.max(CONFIG.THEME_STARS, 12) do
-        local dot = make("Frame", {
-            Name = "Star" .. index, BorderSizePixel = 0, Active = false, ZIndex = 1,
-            Position = UDim2.fromScale(random:NextNumber(0.03, 0.97), random:NextNumber(0.10, 0.96)),
-            BackgroundColor3 = (index % 7 == 0) and THEME.cyan or (index % 3 == 0) and THEME.accentHot
-                or Color3.fromRGB(232, 226, 255),
-        }, starfield)
-        local dotSize = random:NextInteger(2, 3)
-        dot.Size = UDim2.fromOffset(dotSize, dotSize)
-        dot.BackgroundTransparency = random:NextNumber(0.30, 0.62)
-        corner(999, dot)
-        local tween = TweenService:Create(dot, TweenInfo.new(
-            random:NextNumber(1.4, 3.4), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
-        ), {
-            BackgroundTransparency = 0.88,
-            Size = UDim2.fromOffset(dotSize + 1, dotSize + 1),
-        })
-        tween:Play()
-        starTweens[#starTweens + 1] = tween
-    end
-    for index, spec in ipairs({ { 132, THEME.accent, 0.94 }, { 96, THEME.cyan, 0.95 }, { 72, THEME.accentHot, 0.95 } }) do
-        local nebula = make("Frame", {
-            Name = "Nebula" .. index, BorderSizePixel = 0, Active = false, ZIndex = 1,
-            Position = UDim2.fromScale(random:NextNumber(0.08, 0.78), random:NextNumber(0.14, 0.70)),
-            Size = UDim2.fromOffset(spec[1], spec[1]), BackgroundColor3 = spec[2],
-            BackgroundTransparency = spec[3],
-        }, starfield)
-        corner(999, nebula)
-        local breathe = TweenService:Create(nebula, TweenInfo.new(4 + index, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
-            BackgroundTransparency = math.min(0.985, spec[3] + 0.03),
-        })
-        breathe:Play()
-        starTweens[#starTweens + 1] = breathe
-    end
+UI.header = make("Frame", {
+    Name = "Header", BackgroundColor3 = THEME.panelLow, BorderSizePixel = 0, ZIndex = 12,
+}, UI.panel)
+corner(10, UI.header)
+stroke(UI.header, THEME.line, 1, 0.28)
+UI.title = label(UI.panel, "M0x46 // LIVE FEED", UDim2.new(), UDim2.new(), THEME.text, 17)
+UI.title.Font = Enum.Font.GothamBlack
+UI.title.ZIndex = 14
+UI.statusText = label(UI.panel, "connecting…", UDim2.new(), UDim2.new(), THEME.muted, 10)
+UI.statusText.Font = Enum.Font.Gotham
+UI.statusText.ZIndex = 14
+UI.closeButton = button(UI.panel, { Name = "Close", Text = "×", TextSize = 17, CornerRadius = 8, ZIndex = 15 }, false)
+UI.closeButton.TextColor3 = THEME.redHot
+
+UI.autoJoinToggle = button(UI.panel, { Name = "AutoJoinToggle", Text = "AUTO-JOIN: OFF", CornerRadius = 9, ZIndex = 15 }, false)
+UI.autoForceToggle = button(UI.panel, { Name = "AutoForceToggle", Text = "AUTO-FORCE: OFF", CornerRadius = 9, ZIndex = 15 }, false)
+UI.filterButton = button(UI.panel, { Name = "RarityFilter", Text = "RARITY: ANY", CornerRadius = 8, ZIndex = 14 }, false)
+UI.refreshButton = button(UI.panel, { Name = "Refresh", Text = "REFRESH", CornerRadius = 8, ZIndex = 14 }, true)
+UI.clearButton = button(UI.panel, { Name = "Clear", Text = "CLEAR", CornerRadius = 8, ZIndex = 14 }, false)
+
+UI.localTab = button(UI.panel, { Name = "TabLocal", Text = "MY SERVER", CornerRadius = 7, ZIndex = 14 }, false)
+UI.feedTab = button(UI.panel, { Name = "TabAll", Text = "ALL SERVERS", CornerRadius = 7, ZIndex = 14 }, true)
+UI.countJoin = label(UI.panel, "JOINABLE 0", UDim2.new(), UDim2.new(), THEME.green, 9)
+UI.countTaken = label(UI.panel, "TAKEN 0", UDim2.new(), UDim2.new(), THEME.redHot, 9)
+UI.countFull = label(UI.panel, "FULL 0", UDim2.new(), UDim2.new(), THEME.amber, 9)
+UI.countUnknown = label(UI.panel, "UNKNOWN 0", UDim2.new(), UDim2.new(), THEME.blue, 9)
+for _, chip in ipairs({ UI.countJoin, UI.countTaken, UI.countFull, UI.countUnknown }) do
+    chip.TextXAlignment = Enum.TextXAlignment.Center
+    chip.BackgroundColor3 = THEME.panelHigh
+    chip.BackgroundTransparency = 0.06
+    chip.ZIndex = 14
+    corner(5, chip)
+    stroke(chip, THEME.line, 1, 0.45)
 end
 
--- header ----------------------------------------------------------------------
-local HEADER_H = 52
-local header = make("Frame", {
-    Name = "Header", Position = UDim2.fromOffset(1, 1), Size = UDim2.new(1, -2, 0, HEADER_H),
-    BackgroundColor3 = THEME.bgDeep, BackgroundTransparency = 0.12, BorderSizePixel = 0, ZIndex = 12,
-}, panel)
-corner(12, header)
-make("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(130, 118, 170)) }, header)
-
-local title = label(panel, "M0x46 FINDER", UDim2.fromOffset(16, 8), UDim2.new(1, -118, 0, 24), THEME.text, 18)
-title.Font = Enum.Font.GothamBlack
-title.ZIndex = 13
-make("UIGradient", {
-    Rotation = 0,
-    Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(198, 164, 255)),
-}, title)
-stroke(title, Color3.fromRGB(5, 3, 12), 1.4, 0.35)
-
-local statusText = label(panel, "connecting…", UDim2.fromOffset(16, 31), UDim2.new(1, -118, 0, 15), THEME.cyan, 10)
-statusText.ZIndex = 13
-statusText.Font = Enum.Font.Gotham
-
-local minimizeButton = button(panel, {
-    Name = "Minimize", Text = "—", Position = UDim2.new(1, -78, 0, 13),
-    Size = UDim2.fromOffset(30, 28), TextSize = 15, CornerRadius = 8, ZIndex = 14,
-}, false)
-local closeButton = button(panel, {
-    Name = "Close", Text = "✕", Position = UDim2.new(1, -44, 0, 13),
-    Size = UDim2.fromOffset(30, 28), TextSize = 12, CornerRadius = 8, ZIndex = 14,
-}, false)
-closeButton.TextColor3 = THEME.red
-closeButton.BackgroundColor3 = Color3.fromRGB(120, 34, 44)
-closeButton.BackgroundTransparency = 0.35
-
-local hairline = make("Frame", {
-    Name = "Hairline", BorderSizePixel = 0, Active = false, BackgroundColor3 = THEME.accent,
-    Position = UDim2.new(0, 12, 0, HEADER_H + 1), Size = UDim2.new(1, -24, 0, 1), ZIndex = 13,
-}, panel)
-make("UIGradient", { Rotation = 0, Transparency = NumberSequence.new({
-    NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.15, 0.2),
-    NumberSequenceKeypoint.new(0.85, 0.2), NumberSequenceKeypoint.new(1, 1),
-})}, hairline)
-
--- filter row: rarity chip + REFRESH (with the reset countdown inside it) ---------
-local CONTROLS_Y = HEADER_H + 8
-local filterButton = button(panel, {
-    Name = "RarityFilter", Text = "RARITY: ANY",
-    Position = UDim2.fromOffset(10, CONTROLS_Y), Size = UDim2.new(0.56, -14, 0, 32),
-    TextSize = 11, CornerRadius = 8,
-}, false)
-
-local refreshButton = button(panel, {
-    Name = "Refresh", Text = "REFRESH",
-    Position = UDim2.new(0.56, -2, 0, CONTROLS_Y), Size = UDim2.new(0.44, -10, 0, 32),
-    TextSize = 11, CornerRadius = 8, ZIndex = 14,
-}, false)
-refreshButton.BackgroundColor3 = Color3.fromRGB(104, 34, 196)
-stroke(refreshButton, THEME.accentHot, 1.5, 0.1)
-local resetLabel = make("TextLabel", {
-    Name = "Reset", Text = "--:--",
-    Position = UDim2.new(1, -86, 0, 0), Size = UDim2.fromOffset(80, 32),
-    BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 11,
-    TextColor3 = THEME.muted, TextXAlignment = Enum.TextXAlignment.Right,
-    ZIndex = 15, TextTruncate = Enum.TextTruncate.AtEnd,
-}, refreshButton)
-resetLabel.Text = "--:--"
-
--- bottom tab bar (MY SERVER / ALL SERVERS), like the reference ------------------
-local TABS_H = 36
-local FOOTER_BTN_H = 30
-local tabBar = make("Frame", {
-    Name = "Tabs", Position = UDim2.new(0, 10, 1, -(FOOTER_BTN_H + 6 + TABS_H + 8)),
-    Size = UDim2.new(1, -20, 0, TABS_H),
-    BackgroundTransparency = 1, ZIndex = 12,
-}, panel)
-make("UIListLayout", {
-    FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
-    SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center,
-}, tabBar)
-local localTab = button(tabBar, {
-    Name = "TabLocal", Text = "MY SERVER", Size = UDim2.new(0.5, -3, 1, 0),
-    LayoutOrder = 1, TextSize = 12, CornerRadius = 8,
-}, true)
-local feedTab = button(tabBar, {
-    Name = "TabAll", Text = "ALL SERVERS", Size = UDim2.new(0.5, -3, 1, 0),
-    LayoutOrder = 2, TextSize = 12, CornerRadius = 8,
-}, false)
-
--- list ------------------------------------------------------------------------
-local LIST_Y = CONTROLS_Y + 38
-local HINT_H = 16
--- everything the list must leave room for at the bottom
--- takes the panel height as an argument: panelH is declared below, and an
--- unresolved upvalue would silently become a nil global
-local function listInset(height)
-    local hint = height >= 430 and HINT_H or 0
-    return FOOTER_BTN_H + 6 + TABS_H + 8 + hint
-end
-local list = make("ScrollingFrame", {
-    Name = "List", Position = UDim2.fromOffset(10, LIST_Y),
-    Size = UDim2.new(1, -20, 0, 300),
-    BackgroundTransparency = 1, BorderSizePixel = 0,
-    CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    ScrollBarThickness = 5, ScrollBarImageColor3 = Color3.fromRGB(150, 132, 190),
-    ScrollBarImageTransparency = 0.15,
+UI.list = make("ScrollingFrame", {
+    Name = "List", BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 4,
+    ScrollBarImageColor3 = THEME.red, ScrollBarImageTransparency = 0.2,
     ScrollingDirection = Enum.ScrollingDirection.Y, ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
-    ZIndex = 11,
-}, panel)
-make("UIListLayout", {
-    Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder,
-    HorizontalAlignment = Enum.HorizontalAlignment.Left,
-}, list)
-make("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2) }, list)
+    ZIndex = 13,
+}, UI.panel)
+make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, UI.list)
+make("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2), PaddingBottom = UDim.new(0, 4) }, UI.list)
 
--- footer ----------------------------------------------------------------------
-local broadcastButton = button(panel, {
-    Name = "Broadcast", Text = "BROADCAST: ON",
-    Position = UDim2.new(0, 10, 1, -(FOOTER_BTN_H + 8)), Size = UDim2.new(0.5, -13, 0, FOOTER_BTN_H),
-    TextSize = 10, CornerRadius = 8,
-}, false)
-local settingsButton = button(panel, {
-    Name = "Settings", Text = "SETTINGS",
-    Position = UDim2.new(0.5, 3, 1, -(FOOTER_BTN_H + 8)), Size = UDim2.new(0.5, -13, 0, FOOTER_BTN_H),
-    TextSize = 10, CornerRadius = 8,
-}, false)
-
-local footerHint = make("TextLabel", {
-    Name = "FooterHint", Text = "SIGHTINGS SHARED WITH YOUR OWN SERVER",
-    Position = UDim2.new(0, 12, 1, -15), Size = UDim2.new(1, -24, 0, 12),
-    BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 9,
-    TextColor3 = THEME.muted, TextXAlignment = Enum.TextXAlignment.Center,
-    TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5,
-}, panel)
-
---==============================================================================
--- SETTINGS OVERLAY (scrollable so it never overflows on a phone)
---==============================================================================
-local overlay = make("Frame", {
+-- Settings is an in-panel, scrollable diagnostic drawer so mobile never clips it.
+UI.overlay = make("Frame", {
     Name = "SettingsOverlay", Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 1),
-    BackgroundColor3 = THEME.bgDeep, BackgroundTransparency = 0.03, BorderSizePixel = 0,
-    Visible = false, ZIndex = 30,
-}, panel)
-corner(12, overlay)
-stroke(overlay, THEME.accent, 1.4, 0.32)
-
-local overlayTitle = label(overlay, "SETTINGS", UDim2.fromOffset(16, 12), UDim2.new(1, -80, 0, 24), THEME.text, 16)
-overlayTitle.Font = Enum.Font.GothamBlack
-overlayTitle.ZIndex = 31
-
-local overlayClose = button(overlay, {
-    Name = "SettingsClose", Text = "✕", Position = UDim2.new(1, -46, 0, 12),
-    Size = UDim2.fromOffset(30, 26), TextSize = 12, CornerRadius = 8, ZIndex = 31,
-}, false)
-overlayClose.TextColor3 = THEME.red
-
-local overlayBody = make("ScrollingFrame", {
-    Name = "SettingsBody", Position = UDim2.fromOffset(10, 44), Size = UDim2.new(1, -20, 1, -52),
+    BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.01, BorderSizePixel = 0,
+    Visible = false, ZIndex = 50,
+}, UI.panel)
+corner(12, UI.overlay)
+stroke(UI.overlay, THEME.red, 1.6, 0.12)
+UI.overlayTitle = label(UI.overlay, "SETTINGS // SOURCE DIAGNOSTICS", UDim2.fromOffset(16, 12), UDim2.new(1, -70, 0, 22), THEME.text, 15)
+UI.overlayTitle.Font = Enum.Font.GothamBlack
+UI.overlayTitle.ZIndex = 51
+UI.overlayClose = button(UI.overlay, { Name = "SettingsClose", Text = "×", Position = UDim2.new(1, -42, 0, 10), Size = UDim2.fromOffset(30, 28), TextSize = 16, CornerRadius = 8, ZIndex = 52 }, false)
+UI.overlayClose.TextColor3 = THEME.redHot
+UI.overlayBody = make("ScrollingFrame", {
+    Name = "SettingsBody", Position = UDim2.fromOffset(10, 43), Size = UDim2.new(1, -20, 1, -53),
     BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3,
-    ScrollBarImageColor3 = THEME.accent, ScrollingDirection = Enum.ScrollingDirection.Y, ZIndex = 31,
-}, overlay)
-make("UIListLayout", {
-    Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder,
-    HorizontalAlignment = Enum.HorizontalAlignment.Center,
-}, overlayBody)
-make("UIPadding", { PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 10) }, overlayBody)
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3, ScrollBarImageColor3 = THEME.red,
+    ScrollingDirection = Enum.ScrollingDirection.Y, ZIndex = 51,
+}, UI.overlay)
+make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, UI.overlayBody)
+make("UIPadding", { PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 10) }, UI.overlayBody)
 
-local function overRow(height, order)
-    return make("Frame", {
-        Size = UDim2.new(1, -12, 0, height), BackgroundTransparency = 1,
-        LayoutOrder = order, ZIndex = 31,
-    }, overlayBody)
-end
+-- FORCE is deliberately confirmation-gated. This dialog is not an access bypass:
+-- it only decides whether to call Roblox's normal TeleportToPlaceInstance API.
+UI.forceModal = make("Frame", {
+    Name = "ForceConfirm", Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = Color3.fromRGB(0, 0, 0), BackgroundTransparency = 0.18,
+    BorderSizePixel = 0, Visible = false, ZIndex = 80,
+}, UI.panel)
+local forceBox = make("Frame", {
+    Name = "Dialog", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.new(0.78, 0, 0, 196), BackgroundColor3 = THEME.panel,
+    BorderSizePixel = 0, ZIndex = 81,
+}, UI.forceModal)
+corner(10, forceBox); stroke(forceBox, THEME.redHot, 1.5, 0.1)
+UI.forceTitle = label(forceBox, "CONFIRM FORCE JOIN", UDim2.fromOffset(14, 13), UDim2.new(1, -28, 0, 21), THEME.redHot, 14)
+UI.forceTitle.Font = Enum.Font.GothamBlack; UI.forceTitle.ZIndex = 82
+UI.forceBody = label(forceBox, "", UDim2.fromOffset(14, 40), UDim2.new(1, -28, 0, 92), THEME.text, 10)
+UI.forceBody.TextWrapped = true; UI.forceBody.TextYAlignment = Enum.TextYAlignment.Top; UI.forceBody.ZIndex = 82
+UI.forceCancel = button(forceBox, { Name = "ForceCancel", Text = "CANCEL", Position = UDim2.new(0, 14, 1, -45), Size = UDim2.new(0.42, -18, 0, 31), CornerRadius = 8, ZIndex = 83 }, false)
+UI.forceConfirm = button(forceBox, { Name = "ForceConfirmButton", Text = "CONFIRM FORCE", Position = UDim2.new(0.42, 2, 1, -45), Size = UDim2.new(0.58, -16, 0, 31), CornerRadius = 8, ZIndex = 83 }, true)
+UI.forceEntry = nil
 
-local rateRow = overRow(76, 1)
-local rateTitle = label(rateRow, "MINIMUM INCOME", UDim2.fromOffset(2, 0), UDim2.new(1, -4, 0, 16), THEME.muted, 10)
+UI.rateRow = make("Frame", { Name = "RateRow", Size = UDim2.new(1, -10, 0, 72), BackgroundTransparency = 1, LayoutOrder = 1, ZIndex = 51 }, UI.overlayBody)
+local rateTitle = label(UI.rateRow, "MINIMUM INCOME", UDim2.fromOffset(2, 0), UDim2.new(1, -4, 0, 16), THEME.muted, 10)
 rateTitle.Font = Enum.Font.GothamBold
-local rateBox = make("TextBox", {
+UI.rateBox = make("TextBox", {
     Name = "MinRate", Text = moneyFilter(STATE.minRate), PlaceholderText = "1B",
-    Position = UDim2.fromOffset(0, 18), Size = UDim2.new(0.4, -4, 0, 30),
-    BackgroundColor3 = THEME.glassHigh, TextColor3 = THEME.text, TextSize = 13,
-    Font = Enum.Font.GothamBold, ClearTextOnFocus = false, BorderSizePixel = 0, ZIndex = 32,
-    TextXAlignment = Enum.TextXAlignment.Center,
-}, rateRow)
-corner(8, rateBox)
-stroke(rateBox, THEME.accent, 1, 0.4)
-
-local PRESETS = { { label = "OFF", value = 0 }, { label = "250M", value = 2.5e8 }, { label = "1B", value = 1e9 }, { label = "5B", value = 5e9 } }
-local presetButtons = {}
-for index, preset in ipairs(PRESETS) do
-    local presetButton = button(rateRow, {
-        Text = preset.label, Position = UDim2.new(0.4 + (index - 1) * 0.15, 2, 0, 18),
-        Size = UDim2.new(0.15, -4, 0, 30), TextSize = 10, CornerRadius = 7, ZIndex = 32,
+    Position = UDim2.fromOffset(0, 20), Size = UDim2.new(0.36, -3, 0, 30), BackgroundColor3 = THEME.panelHigh,
+    TextColor3 = THEME.text, Font = Enum.Font.GothamBold, TextSize = 13, ClearTextOnFocus = false,
+    BorderSizePixel = 0, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 52,
+}, UI.rateRow)
+corner(7, UI.rateBox)
+stroke(UI.rateBox, THEME.red, 1, 0.35)
+UI.presetButtons = {}
+for index, preset in ipairs({ { "OFF", 0 }, { "250M", 2.5e8 }, { "1B", 1e9 }, { "5B", 5e9 } }) do
+    local item = button(UI.rateRow, {
+        Name = "Preset" .. preset[1], Text = preset[1], Position = UDim2.new(0.36 + (index - 1) * 0.16, 2, 0, 20),
+        Size = UDim2.new(0.16, -4, 0, 30), TextSize = 9, CornerRadius = 7, ZIndex = 52,
     }, false)
-    presetButtons[#presetButtons + 1] = { button = presetButton, value = preset.value }
+    UI.presetButtons[#UI.presetButtons + 1] = { button = item, value = preset[2] }
 end
-local rateHint = label(rateRow, "B/s — 0 or OFF shows every egg", UDim2.fromOffset(2, 54), UDim2.new(1, -4, 0, 14), THEME.muted, 9)
+local rateHint = label(UI.rateRow, "NYX receives this floor; 1B/s is the safe default", UDim2.fromOffset(2, 55), UDim2.new(1, -4, 0, 14), THEME.muted, 9)
 rateHint.Font = Enum.Font.Gotham
 
-local broadcastToggle = button(overlayBody, {
-    Name = "BroadcastToggle", Text = "BROADCAST: ON", Size = UDim2.new(1, -12, 0, 38),
-    LayoutOrder = 2, TextSize = 11, CornerRadius = 9, ZIndex = 31,
-}, false)
-local autoJoinToggle = button(overlayBody, {
-    Name = "AutoJoinToggle", Text = "AUTO JOIN: OFF", Size = UDim2.new(1, -12, 0, 38),
-    LayoutOrder = 3, TextSize = 11, CornerRadius = 9, ZIndex = 31,
-}, false)
-local autoJoinHint = make("TextLabel", {
-    Text = "OFF = JOIN asks SURE? first. ON = JOIN teleports immediately.",
-    Size = UDim2.new(1, -12, 0, 26), BackgroundTransparency = 1, LayoutOrder = 4,
-    Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = THEME.muted,
-    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31,
-}, overlayBody)
+UI.broadcastToggle = button(UI.overlayBody, { Name = "BroadcastToggle", Text = "BROADCAST: ON", Size = UDim2.new(1, -10, 0, 36), LayoutOrder = 2, CornerRadius = 8, ZIndex = 52 }, false)
+UI.infoRow = label(UI.overlayBody, "", UDim2.new(), UDim2.new(1, -10, 0, 220), THEME.muted, 10)
+UI.infoRow.Name = "Diagnostics"
+UI.infoRow.LayoutOrder = 3
+UI.infoRow.TextWrapped = true
+UI.infoRow.TextYAlignment = Enum.TextYAlignment.Top
+UI.infoRow.ZIndex = 52
 
-local infoRow = make("TextLabel", {
-    -- This is deliberately tall: the scrolling overlay can reveal every NYX
-    -- and fallback diagnostic on a short Delta phone instead of truncating it.
-    Name = "Diagnostics", Text = "", Size = UDim2.new(1, -12, 0, 250),
-    BackgroundTransparency = 1, LayoutOrder = 5, Font = Enum.Font.Gotham, TextSize = 10,
-    TextColor3 = THEME.muted, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 31,
-}, overlayBody)
-
-local function paintOverlayInfo()
-    infoRow.Text = table.concat({
-        "backend : " .. rawEndpoint() .. " (fallback)",
-        "nyx     : " .. (CONFIG.NYX.ENABLED
-            and ((NYX.endpoint or "config not read") .. (NYX.error and (" — " .. tostring(NYX.error)) or " · ok"))
-            or "disabled"),
-        "nyx live: " .. tostring(NYX.servers) .. " server(s), " .. tostring(NYX.participants)
-            .. " client(s), ttl " .. tostring(NYX.ttlSeconds) .. "s",
-        "source  : " .. tostring(STATE.feedSource or "none"),
-        "nyx err : " .. tostring(STATE.feedErrors and STATE.feedErrors.nyx or "none"),
-        "own err : " .. tostring(STATE.feedErrors and STATE.feedErrors.own or "none"),
-        "last url: " .. tostring(DIAG.lastUrl or "(nothing requested yet)"),
-        "status   : " .. tostring(STATE.feedError and describeError(STATE.feedError) or (STATE.feedLoaded and "reachable" or "not contacted yet")),
-        "game src : " .. (CAPS.moduleApi and "Client.EggState module" or "attribute scan"),
-        "scanned  : " .. tostring(STATE.scanned) .. " egg(s) in this server",
-        "feed     : " .. tostring(#STATE.feed) .. " remote egg(s) from "
-            .. tostring(STATE.remoteServers) .. " other server(s) (" .. tostring(STATE.feedTotal) .. " on backend)",
-        "my job   : " .. tostring(game.JobId or "?"):sub(1, 18) .. "… (hidden on ALL SERVERS)",
-        "session  : " .. tostring(reporterId):sub(1, 8) .. "… (anonymous)",
-        "row cap  : " .. CONFIG.CARD_LIMIT .. " local / " .. CONFIG.FEED_LIMIT .. " feed",
-        DIAG.problem and ("\n!! " .. DIAG.problem) or "",
-    }, "\n")
-end
-
---==============================================================================
--- RESPONSIVE LAYOUT + DRAG
---==============================================================================
-local panelX, panelY = 18, 64
-local panelW, panelH = 404, 560
-
-local function clampPanel()
+-- Responsive landscape layout. It changes positions/sizes only; cards are pooled
+-- separately and no per-frame animation work is performed.
+function UI.clampPanel()
     local vw, vh = viewport()
-    local maxH = math.max(220, vh - MOBILE_TOPBAR - SCREEN_MARGIN)
-    panelW = clamp(panelW, math.min(260, vw - 16), math.min(440, vw - 16))
-    panelH = clamp(panelH, math.min(260, maxH), math.min(640, maxH))
-    panelX = clamp(panelX, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - panelW - SCREEN_MARGIN))
-    panelY = clamp(panelY, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - panelH - SCREEN_MARGIN))
-    panel.Size = UDim2.fromOffset(panelW, panelH)
-    panel.Position = UDim2.fromOffset(panelX, panelY)
-    footerHint.Visible = panelH >= 430
-    list.Size = UDim2.new(1, -20, 0, math.max(40, panelH - LIST_Y - listInset(panelH)))
+    local maxH = math.max(230, vh - MOBILE_TOPBAR - SCREEN_MARGIN)
+    UI.panelW = clamp(UI.panelW, math.min(320, vw - 16), math.min(820, vw - 16))
+    UI.panelH = clamp(UI.panelH, math.min(248, maxH), math.min(590, maxH))
+    UI.panelX = clamp(UI.panelX, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - UI.panelW - SCREEN_MARGIN))
+    UI.panelY = clamp(UI.panelY, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - UI.panelH - SCREEN_MARGIN))
+    UI.panel.Size = UDim2.fromOffset(UI.panelW, UI.panelH)
+    UI.panel.Position = UDim2.fromOffset(UI.panelX, UI.panelY)
+
+    local compact = UI.panelW < 520 or UI.panelH < 390
+    local side = compact and 76 or 142
+    local contentX, contentW = side + 8, UI.panelW - side - 16
+    local headerH = compact and 48 or 62
+    UI.sidebar.Position = UDim2.fromOffset(0, 0)
+    UI.sidebar.Size = UDim2.fromOffset(side, UI.panelH)
+    UI.brand.Position = UDim2.fromOffset(compact and 7 or 12, 9)
+    UI.brand.Size = UDim2.new(1, -14, 0, compact and 30 or 38)
+    UI.brand.TextSize = compact and 10 or 15
+    UI.connectionDot.Position = UDim2.fromOffset(compact and 8 or 13, compact and 43 or 54)
+    UI.connectionDot.Size = UDim2.fromOffset(compact and 7 or 9, compact and 7 or 9)
+    UI.connectionLabel.Position = UDim2.fromOffset(compact and 18 or 27, compact and 38 or 49)
+    UI.connectionLabel.Size = UDim2.new(1, -(compact and 20 or 30), 0, 16)
+    UI.connectionLabel.TextSize = compact and 7 or 9
+    local navY, navH, navGap = compact and 65 or 84, compact and 27 or 36, compact and 4 or 6
+    for index, control in ipairs({ UI.logsButton, UI.historyButton, UI.settingsButton, UI.usersButton }) do
+        control.Position = UDim2.fromOffset(compact and 5 or 8, navY + (index - 1) * (navH + navGap))
+        control.Size = UDim2.new(1, compact and -10 or -16, 0, navH)
+        control.TextSize = compact and 8 or 11
+        control.Text = compact and ({ "LOG", "HIST", "SET", "USERS" })[index]
+            or ({ "◉  LOGS", "◷  HISTORY", "⚙  SETTINGS", "◌  USERS" })[index]
+    end
+    UI.hideButton.Position = UDim2.new(0, compact and 5 or 8, 1, -(compact and 33 or 43))
+    UI.hideButton.Size = UDim2.new(1, compact and -10 or -16, 0, compact and 27 or 34)
+    UI.hideButton.TextSize = compact and 8 or 11
+
+    UI.header.Position = UDim2.fromOffset(contentX, 8)
+    UI.header.Size = UDim2.fromOffset(contentW, headerH)
+    UI.title.Position = UDim2.fromOffset(contentX + 10, 13)
+    UI.title.Size = UDim2.fromOffset(math.max(88, contentW * 0.42), 20)
+    UI.title.TextSize = compact and 11 or 17
+    UI.statusText.Position = UDim2.fromOffset(contentX + 10, compact and 31 or 37)
+    UI.statusText.Size = UDim2.fromOffset(math.max(90, contentW * 0.44), 15)
+    UI.statusText.TextSize = compact and 8 or 10
+    UI.closeButton.Position = UDim2.fromOffset(contentX + contentW - 34, 17)
+    UI.closeButton.Size = UDim2.fromOffset(26, 25)
+    UI.autoJoinToggle.Position = UDim2.fromOffset(contentX + contentW - (compact and 172 or 226), compact and 12 or 15)
+    UI.autoJoinToggle.Size = UDim2.fromOffset(compact and 82 or 108, compact and 24 or 30)
+    UI.autoForceToggle.Position = UDim2.fromOffset(contentX + contentW - (compact and 86 or 114), compact and 12 or 15)
+    UI.autoForceToggle.Size = UDim2.fromOffset(compact and 80 or 108, compact and 24 or 30)
+    UI.autoJoinToggle.TextSize, UI.autoForceToggle.TextSize = compact and 7 or 9, compact and 7 or 9
+
+    local toolY = headerH + 16
+    UI.filterButton.Position = UDim2.fromOffset(contentX, toolY)
+    UI.filterButton.Size = UDim2.fromOffset(math.floor(contentW * 0.34), compact and 25 or 30)
+    UI.refreshButton.Position = UDim2.fromOffset(contentX + math.floor(contentW * 0.34) + 5, toolY)
+    UI.refreshButton.Size = UDim2.fromOffset(math.floor(contentW * 0.33), compact and 25 or 30)
+    UI.clearButton.Position = UDim2.fromOffset(contentX + math.floor(contentW * 0.68) + 10, toolY)
+    UI.clearButton.Size = UDim2.fromOffset(math.max(43, contentW - math.floor(contentW * 0.68) - 10), compact and 25 or 30)
+    UI.filterButton.TextSize, UI.refreshButton.TextSize, UI.clearButton.TextSize = compact and 8 or 10, compact and 8 or 10, compact and 8 or 10
+
+    local tabY = toolY + (compact and 31 or 37)
+    UI.localTab.Position = UDim2.fromOffset(contentX, tabY)
+    UI.localTab.Size = UDim2.fromOffset(math.floor((contentW - 5) / 2), compact and 22 or 28)
+    UI.feedTab.Position = UDim2.fromOffset(contentX + math.floor((contentW - 5) / 2) + 5, tabY)
+    UI.feedTab.Size = UDim2.fromOffset(math.floor((contentW - 5) / 2), compact and 22 or 28)
+    UI.localTab.TextSize, UI.feedTab.TextSize = compact and 8 or 10, compact and 8 or 10
+
+    local chipY, chipH = tabY + (compact and 27 or 34), compact and 16 or 19
+    local chipW = math.max(42, math.floor((contentW - 9) / 4))
+    for index, chip in ipairs({ UI.countJoin, UI.countTaken, UI.countFull, UI.countUnknown }) do
+        chip.Position = UDim2.fromOffset(contentX + (index - 1) * (chipW + 3), chipY)
+        chip.Size = UDim2.fromOffset(chipW, chipH)
+        chip.TextSize = compact and 7 or 9
+    end
+    local listY = chipY + chipH + 7
+    UI.list.Position = UDim2.fromOffset(contentX, listY)
+    UI.list.Size = UDim2.fromOffset(contentW, math.max(44, UI.panelH - listY - 8))
 end
 
-local function clampLauncher()
+function UI.clampLauncher()
     local vw, vh = viewport()
-    local position = launcher.Position
-    local x = clamp(position.X.Offset, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - 62 - SCREEN_MARGIN))
-    local y = clamp(position.Y.Offset, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - 62 - SCREEN_MARGIN))
-    launcher.Position = UDim2.fromOffset(x, y)
+    local p = UI.launcher.Position
+    UI.launcher.Position = UDim2.fromOffset(
+        clamp(p.X.Offset, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - 60 - SCREEN_MARGIN)),
+        clamp(p.Y.Offset, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - 60 - SCREEN_MARGIN))
+    )
 end
 
--- card height follows the panel so a phone still shows 3-4 real rows
-local function cardHeight()
-    clampPanel()
-    local listHeight = math.max(40, panelH - LIST_Y - listInset(panelH))
-    return math.floor(clamp(listHeight / 2.9 - 5, 62, 104))
+function UI.cardHeight()
+    return UI.panelH < 330 and 64 or UI.panelH < 450 and 82 or 98
 end
 
-local function cardRows()
-    local height = cardHeight()
-    if height >= 88 then return 3 end
-    if height >= 74 then return 2 end
-    return 1
-end
-
-local function applyLayout()
-    clampPanel()
-    clampLauncher()
+function UI.applyLayout()
+    UI.clampPanel()
+    UI.clampLauncher()
     markDirty()
 end
 
 do
-    local dragging, dragTarget, startMouse, startOffset = false, nil, nil, nil
-
-    local function beginDrag(handle, target)
+    local dragging, target, startMouse, startOffset = false, nil, nil, nil
+    local function beginDrag(handle, object)
         handle.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                dragTarget = target
-                startMouse = input.Position
-                startOffset = target.Position
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging, target, startMouse, startOffset = true, object, input.Position, object.Position
             end
         end)
     end
-
-    beginDrag(header, panel)
-    beginDrag(launcher, launcher)
-
+    beginDrag(UI.header, UI.panel)
+    beginDrag(UI.launcher, UI.launcher)
     UserInputService.InputChanged:Connect(function(input)
-        if not dragging or not dragTarget then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement
-            and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        local delta = input.Position - startMouse
-        local vw, vh = viewport()
-        local width = dragTarget == panel and panelW or 62
-        local height = dragTarget == panel and panelH or 62
-        local x = clamp(startOffset.X.Offset + delta.X, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - width - SCREEN_MARGIN))
-        local y = clamp(startOffset.Y.Offset + delta.Y, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - height - SCREEN_MARGIN))
-        dragTarget.Position = UDim2.fromOffset(x, y)
+        if not dragging or not target then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local delta, vw, vh = input.Position - startMouse, viewport()
+        local width, height = target == UI.panel and UI.panelW or 60, target == UI.panel and UI.panelH or 60
+        target.Position = UDim2.fromOffset(
+            clamp(startOffset.X.Offset + delta.X, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - width - SCREEN_MARGIN)),
+            clamp(startOffset.Y.Offset + delta.Y, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - height - SCREEN_MARGIN))
+        )
     end)
-
     UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-            and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if not dragging then return end
-        dragging = false
-        if dragTarget == panel then
-            local position = panel.Position
-            panelX, panelY = position.X.Offset, position.Y.Offset
-        end
-        dragTarget = nil
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if target == UI.panel then UI.panelX, UI.panelY = UI.panel.Position.X.Offset, UI.panel.Position.Y.Offset end
+        dragging, target = false, nil
     end)
 end
 
-if workspace.CurrentCamera then
-    pcall(function()
-        workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-            -- render() is defined later; main loop redraws after markDirty().
-            applyLayout()
-        end)
-    end)
-end
+pcall(function()
+    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(UI.applyLayout)
+end)
 
---==============================================================================
--- GRADIENT ANIMATION  (engine-side tween: no per-frame Lua cost)
---==============================================================================
-local MUTATION_PALETTE = {
-    golden = { Color3.fromRGB(198, 156, 0), Color3.fromRGB(255, 196, 20), Color3.fromRGB(255, 236, 140) },
-    silver = { Color3.fromRGB(126, 126, 132), Color3.fromRGB(206, 206, 214), Color3.fromRGB(255, 255, 255) },
-    rainbow = { Color3.fromRGB(255, 70, 90), Color3.fromRGB(255, 196, 60), Color3.fromRGB(86, 232, 140), Color3.fromRGB(76, 190, 255), Color3.fromRGB(186, 96, 255) },
-    frozen = { Color3.fromRGB(150, 210, 255), Color3.fromRGB(226, 244, 255), Color3.fromRGB(120, 180, 240) },
-    shadow = { Color3.fromRGB(96, 60, 160), Color3.fromRGB(40, 24, 70), Color3.fromRGB(150, 100, 220) },
-}
-
-local liveGradients = {}
-
-local function colorSequence(palette)
-    local points = {}
-    local count = #palette
-    for index = 0, count do
-        points[#points + 1] = ColorSequenceKeypoint.new(index / count, palette[(index % count) + 1])
-    end
-    return ColorSequence.new(points)
-end
-
--- Engine-tweened Offset: an animated rainbow costs zero Lua cycles.
-local function scrollGradient(object, palette, seconds)
-    local gradient = make("UIGradient", {
-        Color = colorSequence(palette), Rotation = 0, Offset = Vector2.new(0, 0),
-    }, object)
-    local tween = TweenService:Create(gradient, TweenInfo.new(
-        seconds or 3.2, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false
-    ), { Offset = Vector2.new(1, 0) })
-    tween:Play()
-    liveGradients[gradient] = tween
-    return gradient
-end
-
-local function mutationPalette(mutationName)
-    return MUTATION_PALETTE[tostring(mutationName or ""):lower()]
-end
-
-local function paintMutation(object, mutationName)
-    local palette = mutationPalette(mutationName)
-    if not palette then return false end
-    if object:IsA("TextLabel") or object:IsA("TextButton") then
-        object.TextColor3 = Color3.new(1, 1, 1)
-        scrollGradient(object, palette, 2.6)
-    end
-    return true
-end
-
-local function clearGradients()
-    for gradient, tween in pairs(liveGradients) do
-        pcall(function() tween:Cancel() end)
-        if gradient then pcall(function() gradient:Destroy() end) end
-    end
-    liveGradients = {}
-end
 
 --==============================================================================
 -- JOIN  (implementation must sit ABOVE the card renderer: a `local function`
@@ -1619,6 +1469,9 @@ end
 -- A teleport is only attempted with a placeId taken from the report and a jobId
 -- that passes the real Roblox job-id shape test. Everything else is refused out
 -- loud instead of being passed to TeleportToPlaceInstance and failing invisibly.
+local openForceConfirm
+local actionAllowed
+
 local function validPlaceId(placeId)
     local value = tonumber(placeId)
     return value ~= nil and value > 0 and value == math.floor(value)
@@ -1641,20 +1494,15 @@ local function jobShape(jobId)
     return false, "JobId shape is not a Roblox job id"
 end
 
--- Ask the network that published the row whether it is still claimable.
--- Returns "ok", or a refusal reason string. A network that cannot answer must
--- never block a join the player explicitly confirmed, so failures return "ok"
--- and the teleport itself reports any real problem.
+-- Ask only the source that published the row. Standard JOIN must receive an
+-- explicit `allowed=true`; a network error, stale claim, or unknown refusal
+-- never becomes a teleport or a fake TAKEN state.
 function NYX.claimRemote(entry)
-    -- Never ask the own backend to authorise a NYX row (or vice versa): it does
-    -- not possess the other network's reservation state. A transport failure is
-    -- explicitly shown as "claim unverified" and the player's confirmed JOIN is
-    -- still allowed to teleport, rather than being silently misclassified.
-    if not CAPS.network then return "ok", "HTTP unavailable" end
+    if not CAPS.network then return "network", "HTTP unavailable" end
     local data, err
     if entry and entry.source == "nyx" then
         data, err = NYX.claim(entry)
-        if not data then return "ok", "NYX claim unavailable: " .. tostring(err or "request failed") end
+        if not data then return "network", "NYX claim unavailable: " .. tostring(err or "request failed") end
         return NYX.claimVerdict(data)
     end
     data, err = api("POST", "/v1/join", {
@@ -1663,294 +1511,337 @@ function NYX.claimRemote(entry)
         uid = entry and entry.uid,
         reporterId = reporterId,
     })
-    if not data then return "ok", "backend claim unavailable: " .. tostring(err or "request failed") end
+    if not data then return "network", "own-backend claim unavailable: " .. tostring(err or "request failed") end
     return NYX.claimVerdict(data)
+end
+
+local function teleportEntry(entry, mode)
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(tonumber(entry.placeId), entry.jobId, player)
+    end)
+    if not ok then
+        NYX.note("TELEPORT ERROR", tostring(err))
+        notify("teleport failed: " .. tostring(err), 8)
+        return false
+    end
+    NYX.note(mode == "force" and "FORCE" or "JOIN", "teleport requested for " .. shortId(entry.jobId))
+    notify((mode == "force" and "force teleport requested → " or "teleport requested → ") .. shortId(entry.jobId), 6)
+    return true
 end
 
 local function requestJoin(entry)
     local shapeOk, shapeWhy = jobShape(entry.jobId)
     if not shapeOk then
-        notify("cannot join: " .. tostring(shapeWhy), 6)
+        NYX.note("JOIN BLOCKED", tostring(shapeWhy))
+        notify("cannot JOIN: " .. tostring(shapeWhy), 6)
         return false
     end
     if not validPlaceId(entry.placeId) then
-        notify("cannot join: report has no valid PlaceId", 6)
+        NYX.note("JOIN BLOCKED", "report has no valid PlaceId")
+        notify("cannot JOIN: report has no valid PlaceId", 6)
         return false
     end
-    local placeId = tonumber(entry.placeId)
-    notify(string.format("checking %s (%d)…", shortId(entry.jobId), placeId), 8)
-
-    local verdict, detail = "ok", nil
-    if CAPS.network then
-        local ok, result, why = pcall(NYX.claimRemote, entry)
-        if ok then verdict, detail = result, why else verdict = "ok" end
+    local state = STATUS.of(entry, NYX.now())
+    if state == "taken" or state == "full" or state == "expired" then
+        NYX.note("JOIN BLOCKED", "report is " .. string.upper(state))
+        notify("cannot JOIN: this report is " .. string.upper(state) .. " — refresh for a fresh report", 7)
+        return false
     end
-    if verdict ~= "ok" then
-        notify("cannot join: " .. tostring(verdict), 8)
-        -- Preserve the refusal accurately: an expired/claimed egg is TAKEN,
-        -- while an actual population refusal is FULL. Both remove JOIN on redraw.
-        local refusal = tostring(verdict):lower()
-        if refusal:find("full", 1, true) then
-            entry.full = true
-        else
-            entry.taken = true
-        end
+    NYX.note("JOIN", "source preflight for " .. shortId(entry.jobId))
+    notify("source preflight for " .. shortId(entry.jobId) .. "…", 8)
+    local ok, kind, detail = pcall(NYX.claimRemote, entry)
+    if not ok then kind, detail = "network", "claim call failed" end
+    if kind ~= "allowed" then
+        -- Only an explicit source response can label FULL or TAKEN. Expired,
+        -- unavailable, generic refusals and network failures remain UNKNOWN.
+        entry.claimStatus = kind
+        entry.claimDetail = detail
+        NYX.note("JOIN REFUSED", tostring(detail or kind))
         markDirty()
-        renderIfDirty()
+        notify("JOIN not sent: " .. tostring(detail or kind), 8)
         return false
     end
-    if detail then
-        -- claim could not be checked; say so instead of pretending it was
-        notify("claim unverified (" .. tostring(detail) .. ") — teleporting anyway", 6)
-    end
-    local ok, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(placeId, entry.jobId, player)
-    end)
-    if not ok then
-        notify("teleport failed: " .. tostring(err), 8)
+    entry.claimStatus = nil
+    entry.claimDetail = nil
+    NYX.note("JOIN", "preflight allowed for " .. shortId(entry.jobId))
+    return teleportEntry(entry, "join")
+end
+
+-- FORCE JOIN is a direct Roblox teleport attempt after the user confirms it on
+-- the card. It skips only our optional claim preflight; it cannot bypass a full
+-- server, Roblox access restrictions, or any game/security check.
+local function requestForceJoin(entry, confirmed)
+    if confirmed ~= true then
+        NYX.note("FORCE BLOCKED", "confirmation required")
+        notify("FORCE requires the confirmation dialog", 6)
         return false
     end
-    notify("teleport requested → " .. shortId(entry.jobId), 6)
+    local shapeOk, shapeWhy = jobShape(entry.jobId)
+    if not shapeOk then
+        NYX.note("FORCE BLOCKED", tostring(shapeWhy))
+        notify("cannot FORCE: " .. tostring(shapeWhy), 6)
+        return false
+    end
+    if not validPlaceId(entry.placeId) then
+        NYX.note("FORCE BLOCKED", "report has no valid PlaceId")
+        notify("cannot FORCE: report has no valid PlaceId", 6)
+        return false
+    end
+    local state = STATUS.of(entry, NYX.now())
+    if state == "taken" or state == "full" or state == "expired" then
+        NYX.note("FORCE BLOCKED", "confirmed " .. string.upper(state))
+        notify("FORCE is unavailable for confirmed " .. string.upper(state), 7)
+        return false
+    end
+    NYX.note("FORCE", "manual direct teleport requested for " .. shortId(entry.jobId))
+    return teleportEntry(entry, "force")
+end
+
+openForceConfirm = function(entry, automaticPrompt)
+    if not entry or not actionAllowed(entry) then
+        notify("FORCE is not available for this report", 5)
+        return false
+    end
+    UI.forceEntry = entry
+    UI.forceBody.Text = table.concat({
+        "Directly request a Roblox teleport to " .. shortId(entry.jobId) .. ".",
+        "This skips only M0x46's optional NYX or own-backend preflight.",
+        "It cannot bypass a full server, private access, security restrictions, or Roblox checks.",
+        automaticPrompt and "AUTO-FORCE found a JOINABLE report; your manual confirmation is still required." or "Confirm only if you want to try this server now.",
+    }, "\n\n")
+    UI.forceModal.Visible = true
     return true
 end
 
---==============================================================================
--- CARD RENDERER  (icon | rank | name / rarity / income+weight / mutations | JOIN)
---==============================================================================
-local function clearList()
-    clearGradients()
-    for _, child in ipairs(list:GetChildren()) do
-        if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
-            child:Destroy()
+local function currentFeedEntry(entry)
+    if not entry then return nil end
+    for _, fresh in ipairs(STATE.feed or {}) do
+        if fresh.source == entry.source and fresh.uid == entry.uid and fresh.jobId == entry.jobId then
+            return fresh
         end
     end
-end
-
-local function weightText(entry)
-    if validNumber(entry.weight) then return compact(entry.weight) .. " KG" end
-    if validNumber(entry.scale) then return "×" .. compact(entry.scale) end
     return nil
 end
 
-local function serverLine(entry)
-    if entry.isLocal or entry.jobId == nil or entry.jobId == game.JobId then
-        return "THIS SERVER", true
+UI.forceCancel.MouseButton1Click:Connect(function()
+    UI.forceEntry, UI.forceModal.Visible = nil, false
+    notify("FORCE cancelled", 3)
+end)
+UI.forceConfirm.MouseButton1Click:Connect(function()
+    local entry = currentFeedEntry(UI.forceEntry)
+    UI.forceEntry, UI.forceModal.Visible = nil, false
+    if not entry then
+        NYX.note("FORCE BLOCKED", "report left the fresh feed")
+        notify("FORCE cancelled: that report is no longer in the fresh feed", 6)
+        return
     end
-    return "SERVER " .. shortId(entry.jobId), false
+    requestForceJoin(entry, true)
+end)
+
+--==============================================================================
+-- POOLED LIVE-FEED CARDS
+-- Each card is built once and rebound on refresh. This avoids GUI churn on Delta
+-- while preserving real report metadata, source provenance and status evidence.
+--==============================================================================
+local cardPool, pendingActions = {}, {}
+
+function STATUS.text(entry)
+    local state = STATUS.of(entry, NYX.now())
+    if state == "joinable" then return "JOINABLE" end
+    if state == "taken" then return "TAKEN" end
+    if state == "full" then return "FULL" end
+    if state == "expired" then return "EXPIRED" end
+    if entry and entry.claimStatus == "unavailable" then return "UNAVAILABLE" end
+    return "UNKNOWN"
 end
 
-local SURE_COLOR = Color3.fromRGB(190, 132, 30)
-local JOIN_COLOR = Color3.fromRGB(40, 160, 85)
-local HERE_COLOR = Color3.fromRGB(86, 90, 100)
-local pendingJoins = {}
+function STATUS.color(entry)
+    local state = STATUS.of(entry, NYX.now())
+    if state == "joinable" then return THEME.green end
+    if state == "taken" then return THEME.redHot end
+    if state == "full" then return THEME.amber end
+    if state == "expired" then return THEME.gray end
+    return THEME.blue
+end
+
+actionAllowed = function(entry)
+    local state = STATUS.of(entry, NYX.now())
+    if state ~= "joinable" and state ~= "unknown" then return false end
+    if entry.claimStatus == "expired" or entry.claimStatus == "unavailable" then return false end
+    local shape = jobShape(entry.jobId)
+    return shape and validJobId(entry.jobId) and validPlaceId(entry.placeId)
+end
+
+function NYX.note(kind, message)
+    local rows = STATE.history
+    table.insert(rows, 1, { at = os.time(), kind = tostring(kind or "INFO"), text = tostring(message or "") })
+    while #rows > 40 do table.remove(rows) end
+end
+
+local function reportAge(entry)
+    local seen = tonumber(entry and entry.seenAt)
+    if not seen or seen <= 0 then return "age ?" end
+    local seconds = math.max(0, math.floor((NYX.now() - seen) / 1000))
+    if seconds < 60 then return seconds .. "s ago" end
+    return math.floor(seconds / 60) .. "m ago"
+end
+
+local function createCard(index)
+    local root = make("Frame", {
+        Name = "Card" .. index, Size = UDim2.new(1, -4, 0, UI.cardHeight()),
+        BackgroundColor3 = CARD_BG, BackgroundTransparency = 0.02, BorderSizePixel = 0,
+        ClipsDescendants = true, ZIndex = 14,
+    }, UI.list)
+    corner(8, root)
+    local outline = stroke(root, THEME.line, 1, 0.25)
+    local strip = make("Frame", { Name = "StatusStrip", Position = UDim2.fromOffset(0, 5), Size = UDim2.new(0, 3, 1, -10), BackgroundColor3 = THEME.red, BorderSizePixel = 0, ZIndex = 15 }, root)
+    corner(2, strip)
+    local iconBack = make("Frame", { Name = "IconBack", BackgroundColor3 = THEME.panelHigh, BorderSizePixel = 0, ZIndex = 15 }, root)
+    corner(7, iconBack)
+    local icon = make("ImageLabel", { Name = "EggIcon", BackgroundTransparency = 1, Image = "", ScaleType = Enum.ScaleType.Fit, ZIndex = 16 }, iconBack)
+    local glyph = label(iconBack, "◉", UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), THEME.redHot, 18)
+    glyph.Name = "EggGlyph"
+    glyph.TextSize = 10
+    glyph.TextXAlignment = Enum.TextXAlignment.Center
+    glyph.TextYAlignment = Enum.TextYAlignment.Center
+    glyph.ZIndex = 16
+    local name = label(root, "", UDim2.new(), UDim2.new(), THEME.text, 14)
+    name.Name = "EggName"; name.Font = Enum.Font.GothamBlack; name.ZIndex = 16
+    local income = label(root, "", UDim2.new(), UDim2.new(), THEME.green, 13)
+    income.Name = "Income"; income.Font = Enum.Font.GothamBlack; income.ZIndex = 16
+    local rarity = label(root, "", UDim2.new(), UDim2.new(), THEME.muted, 9)
+    rarity.Name = "Rarity"; rarity.ZIndex = 16
+    local server = label(root, "", UDim2.new(), UDim2.new(), THEME.muted, 9)
+    server.Name = "Area"; server.ZIndex = 16
+    local age = label(root, "", UDim2.new(), UDim2.new(), THEME.muted, 9)
+    age.Name = "ReportAge"; age.TextXAlignment = Enum.TextXAlignment.Right; age.ZIndex = 16
+    local status = label(root, "", UDim2.new(), UDim2.new(), THEME.blue, 9)
+    status.Name = "JoinStatus"; status.TextXAlignment = Enum.TextXAlignment.Center; status.ZIndex = 16
+    local join = button(root, { Name = "JoinButton", Text = "JOIN", CornerRadius = 7, ZIndex = 17 }, true)
+    local force = button(root, { Name = "ForceButton", Text = "FORCE", CornerRadius = 7, ZIndex = 17 }, false)
+    local slot = { root = root, outline = outline, strip = strip, iconBack = iconBack, icon = icon, glyph = glyph, name = name, income = income, rarity = rarity, server = server, age = age, status = status, join = join, force = force, entry = nil, pending = nil }
+    join.MouseButton1Click:Connect(function()
+        local entry = slot.entry
+        if not entry or not actionAllowed(entry) then return end
+        if CONFIG.AUTO_JOIN then requestJoin(entry); return end
+        if slot.pending == "join" and os.clock() < (slot.pendingUntil or 0) then
+            slot.pending = nil; requestJoin(entry); return
+        end
+        slot.pending, slot.pendingUntil = "join", os.clock() + 5
+        join.Text = "SURE?"
+        notify("tap JOIN again to preflight " .. shortId(entry.jobId), 5)
+    end)
+    force.MouseButton1Click:Connect(function()
+        local entry = slot.entry
+        if not entry or not actionAllowed(entry) then return end
+        openForceConfirm(entry, false)
+    end)
+    cardPool[index] = slot
+    pendingActions[#pendingActions + 1] = slot
+    return slot
+end
+
+local function clearList()
+    -- Detach pooled controls rather than destroy them. This avoids hidden pool
+    -- slots contributing blank space to UIListLayout/AutomaticCanvasSize.
+    for _, slot in ipairs(cardPool) do
+        slot.root.Visible = false
+        slot.root.Parent = nil
+        slot.entry, slot.pending = nil, nil
+    end
+    if UI.infoCard then
+        UI.infoCard.root.Visible = false
+        UI.infoCard.root.Parent = nil
+    end
+end
+
+local function bindCard(slot, entry, index)
+    if slot.root.Parent ~= UI.list then slot.root.Parent = UI.list end
+    local height = UI.cardHeight()
+    local compact = height <= 66
+    local action = actionAllowed(entry)
+    local state = STATUS.of(entry, NYX.now())
+    local statusText, statusColor = STATUS.text(entry), STATUS.color(entry)
+    local spec = raritySpec(entry)
+    local iconSize = compact and 30 or 42
+    local left = iconSize + 16
+    local actionW, gap = compact and 51 or 65, compact and 4 or 6
+    local right = action and (actionW * 2 + gap + 12) or 92
+    slot.root.Visible = true
+    slot.root.LayoutOrder = index
+    slot.root.Size = UDim2.new(1, -4, 0, height)
+    slot.root.BackgroundColor3 = state == "taken" and Color3.fromRGB(27, 10, 12) or CARD_BG
+    slot.strip.BackgroundColor3 = statusColor
+    slot.outline.Color = action and THEME.red or statusColor
+    slot.outline.Transparency = action and 0.22 or 0.36
+    slot.iconBack.Position = UDim2.fromOffset(8, math.floor((height - iconSize) / 2))
+    slot.iconBack.Size = UDim2.fromOffset(iconSize, iconSize)
+    slot.icon.Image = entry.icon or ""
+    slot.icon.Visible = entry.icon ~= nil
+    slot.glyph.Visible = entry.icon == nil
+    slot.glyph.TextColor3 = spec.color
+    slot.name.Text = tostring(entry.name)
+    slot.name.TextColor3 = spec.color
+    slot.name.Position = UDim2.fromOffset(left, 7)
+    slot.name.Size = UDim2.new(1, -(left + right), 0, compact and 16 or 21)
+    slot.name.TextSize = compact and 10 or 14
+    slot.income.Text = money(entry.rate)
+    slot.income.Position = UDim2.fromOffset(left, compact and 25 or 29)
+    slot.income.Size = UDim2.new(1, -(left + right), 0, compact and 14 or 17)
+    slot.income.TextSize = compact and 9 or 13
+    slot.rarity.Text = string.upper(tostring(entry.rarity)) .. "  •  " .. (entry.mutations and #entry.mutations > 0 and table.concat(entry.mutations, ", ") or "no mutation")
+    slot.rarity.Position = UDim2.fromOffset(left, compact and 40 or 48)
+    slot.rarity.Size = UDim2.new(1, -(left + right), 0, 12)
+    slot.rarity.TextSize = compact and 7 or 9
+    slot.server.Text = (entry.isLocal and "THIS SERVER" or "SERVER " .. shortId(entry.jobId))
+        .. (entry.area and ("  •  " .. tostring(entry.area)) or "")
+    slot.server.Position = UDim2.fromOffset(left, compact and 50 or 66)
+    slot.server.Size = UDim2.new(1, -(left + right), 0, 12)
+    slot.server.TextSize = compact and 7 or 9
+    slot.age.Text = reportAge(entry)
+    slot.age.Position = UDim2.new(1, -(right - 2), 0, compact and 5 or 7)
+    slot.age.Size = UDim2.fromOffset(right - 8, 13)
+    slot.age.TextSize = compact and 7 or 8
+    slot.status.Text, slot.status.TextColor3 = entry.isLocal and "HERE" or statusText, entry.isLocal and THEME.muted or statusColor
+    slot.status.Position = UDim2.new(1, -(right - 2), 0, compact and 19 or 24)
+    slot.status.Size = UDim2.fromOffset(right - 8, 15)
+    slot.status.TextSize = compact and 7 or 9
+    slot.join.Visible, slot.force.Visible = action and not entry.isLocal, action and not entry.isLocal
+    if action and not entry.isLocal then
+        local y, h = compact and 38 or 52, compact and 21 or 27
+        slot.join.Position = UDim2.new(1, -(actionW * 2 + gap + 8), 0, y)
+        slot.join.Size = UDim2.fromOffset(actionW, h)
+        slot.force.Position = UDim2.new(1, -(actionW + 8), 0, y)
+        slot.force.Size = UDim2.fromOffset(actionW, h)
+        slot.join.Text = slot.pending == "join" and "SURE?" or "JOIN"
+        slot.force.Text = "FORCE"
+        slot.join.TextSize, slot.force.TextSize = compact and 7 or 10, compact and 7 or 10
+        slot.join.BackgroundColor3 = THEME.redDeep
+        slot.force.BackgroundColor3 = THEME.panelHigh
+    end
+    slot.entry = entry
+end
 
 local function makeCard(entry, index)
-    local spec = raritySpec(entry)
-    local rows = cardRows()
-    local height = cardHeight()
-    local rank = displayRank(entry)
-    -- a card is only JOIN-able if BOTH ids would survive validation
-    local canJoin = validJobId(entry.jobId) and jobShape(entry.jobId) and validPlaceId(entry.placeId)
-    if entry.full == true or entry.taken == true then canJoin = false end
-    local serverText, isHere = serverLine(entry)
-
-    local card = make("Frame", {
-        Name = "Card" .. index, Size = UDim2.new(1, -6, 0, height),
-        BackgroundColor3 = CARD_BG, BackgroundTransparency = 0.10, BorderSizePixel = 0,
-        LayoutOrder = index, ZIndex = 11, ClipsDescendants = true,
-    })
-    corner(8, card)
-    make("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(168, 158, 200)) }, card)
-    stroke(card, isHere and THEME.line or THEME.accent, 1, isHere and 0.55 or 0.3)
-    bevel(card, 12)
-
-    -- left rarity tint bar
-    local tint = make("Frame", {
-        Name = "Tint", Size = UDim2.new(0, 3, 1, -10), Position = UDim2.fromOffset(0, 5),
-        BackgroundColor3 = spec.color, BackgroundTransparency = 0.12, BorderSizePixel = 0, ZIndex = 13,
-    }, card)
-    corner(2, tint)
-
-    -- egg icon (only when the game gives us one)
-    local iconX = 9
-    local iconUrl = type(entry.icon) == "string" and entry.icon or nil
-    if iconUrl and #iconUrl > 0 then
-        local iconSize = math.min(56, height - 26)
-        local iconBack = make("Frame", {
-            Name = "IconBack", Position = UDim2.fromOffset(iconX, math.floor((height - iconSize) / 2)),
-            Size = UDim2.fromOffset(iconSize, iconSize), BackgroundColor3 = THEME.bgDeep,
-            BackgroundTransparency = 0.25, BorderSizePixel = 0, ZIndex = 12,
-        }, card)
-        corner(8, iconBack)
-        stroke(iconBack, spec.color, 1, 0.6)
-        local icon = make("ImageLabel", {
-            Name = "EggIcon", Image = iconUrl, BackgroundTransparency = 1, ZIndex = 13,
-            Position = UDim2.fromOffset(2, 2), Size = UDim2.new(1, -4, 1, -4), ScaleType = Enum.ScaleType.Fit,
-        }, iconBack)
-        local _ = icon
-        iconX = iconX + iconSize + 8
-    end
-
-    -- rank
-    local rankLabel = label(card, "#" .. index, UDim2.fromOffset(iconX, 4), UDim2.fromOffset(34, 24),
-        Color3.fromRGB(220, 224, 235), math.min(20, math.max(14, height - 62)))
-    rankLabel.Font = Enum.Font.GothamBlack
-    rankLabel.ZIndex = 13
-    stroke(rankLabel, Color3.new(0, 0, 0), 1.4, 0.3)
-
-    -- name
-    -- number, not a boolean: `canJoin or isHere and 78 or 66` yields true
-    local joinW = canJoin and 78 or (isHere and 70 or 66)
-    local nameX = iconX + 32
-    local nameLabel = label(card, tostring(entry.name), UDim2.fromOffset(nameX, 3),
-        UDim2.new(1, -(nameX + joinW + 14), 0, 26), spec.color, math.min(18, math.max(13, height - 64)))
-    nameLabel.Font = Enum.Font.GothamBlack
-    nameLabel.ZIndex = 13
-    stroke(nameLabel, Color3.new(0, 0, 0), 1.1, 0.35)
-    local topPalette = nil
-    for _, mutation in ipairs(entry.mutations or {}) do
-        topPalette = topPalette or mutationPalette(mutation)
-    end
-    if topPalette then
-        nameLabel.TextColor3 = Color3.new(1, 1, 1)
-        scrollGradient(nameLabel, topPalette, 3.0)
-    elseif rank >= 8 then
-        scrollGradient(nameLabel, { spec.color, THEME.text, spec.color }, 3.4)
-    end
-
-    -- rarity chip
-    local chipY = height - 21
-    local chip = make("TextLabel", {
-        Name = "Rarity", Text = tostring(entry.rarity):upper(),
-        Position = UDim2.fromOffset(iconX + 30, chipY), Size = UDim2.fromOffset(76, 16),
-        BackgroundColor3 = spec.color, BackgroundTransparency = 0.88, BorderSizePixel = 0,
-        Font = Enum.Font.GothamBold, TextSize = 9, TextColor3 = spec.color,
-        TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 13,
-    }, card)
-    corner(4, chip)
-    stroke(chip, spec.color, 1, 0.5)
-
-    -- income + weight
-    local moneyLabel = label(card, money(entry.rate), UDim2.fromOffset(iconX + 112, chipY - 1),
-        UDim2.fromOffset(110, 18), THEME.green, 15)
-    moneyLabel.Name = "Income"
-    moneyLabel.Font = Enum.Font.GothamBlack
-    moneyLabel.ZIndex = 13
-    local weight = weightText(entry)
-    -- One-row cards have no server/area line, so the remote server id replaces
-    -- the weight/scale readout: a JOIN button must always say which server it
-    -- will put you in.
-    if rows < 3 and not isHere then
-        -- badge regardless of joinability: FULL/TAKEN rows still need to say
-        -- which server they came from
-        weight = "SRV " .. shortId(entry.jobId)
-    end
-    if weight then
-        local weightLabel = make("TextLabel", {
-            Name = "Weight", Text = weight, Position = UDim2.new(1, -(joinW + 116), 0, chipY),
-            Size = UDim2.fromOffset(104, 16), BackgroundTransparency = 1,
-            Font = Enum.Font.GothamBold, TextSize = 10,
-            TextColor3 = weight:sub(1, 4) == "SRV " and THEME.cyan or THEME.muted,
-            TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 13,
-        }, card)
-        local _ = weightLabel
-    end
-
-    -- mutations / server line
-    if rows >= 2 then
-        local flow = make("Frame", {
-            Name = "Mutations", Position = UDim2.fromOffset(nameX, 30),
-            Size = UDim2.new(1, -(nameX + joinW + 14), 0, 16), BackgroundTransparency = 1, ZIndex = 13,
-        }, card)
-        make("UIListLayout", {
-            FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5),
-            SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center,
-        }, flow)
-        local mutations = entry.mutations or {}
-        if #mutations == 0 then
-            local none = make("TextLabel", {
-                Name = "MutNone", Text = "no mutation", Size = UDim2.fromOffset(100, 16),
-                BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 9,
-                TextColor3 = THEME.muted, ZIndex = 13, LayoutOrder = 1,
-            }, flow)
-            local _ = none
-        else
-            for mutationIndex, mutation in ipairs(mutations) do
-                local word = make("TextLabel", {
-                    Name = "Mut" .. mutationIndex, Text = tostring(mutation),
-                    Size = UDim2.fromOffset(math.min(#tostring(mutation) * 7 + 8, 96), 16),
-                    BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, TextSize = 10,
-                    TextColor3 = THEME.text, TextTruncate = Enum.TextTruncate.AtEnd,
-                    LayoutOrder = mutationIndex, ZIndex = 14,
-                }, flow)
-                paintMutation(word, mutation)
-            end
-        end
-        if rows >= 3 then
-            local areaLabel = make("TextLabel", {
-                Name = "Area", Text = (entry.area and ("area " .. tostring(entry.area)) or "area unknown")
-                    .. "  ·  " .. serverText,
-                Position = UDim2.fromOffset(nameX, 48), Size = UDim2.new(1, -(nameX + joinW + 14), 0, 14),
-                BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 9,
-                TextColor3 = isHere and THEME.muted or THEME.cyan,
-                TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 13,
-            }, card)
-            local _ = areaLabel
-        end
-    end
-
-    -- action button
-    local buttonWidth = canJoin and 78 or (isHere and 70 or 66)
-    local buttonHeight = math.min(30, height - 32)
-    local action = button(card, {
-        Name = "JoinStatus",
-        Text = isHere and "HERE"
-            or (entry.taken == true and "TAKEN")
-            or (entry.full == true and "FULL")
-            or (canJoin and "JOIN" or "NO ID"),
-        Position = UDim2.new(1, -(buttonWidth + 9), 0, math.floor((height - buttonHeight) / 2)),
-        Size = UDim2.fromOffset(buttonWidth, buttonHeight), TextSize = 11, CornerRadius = 8, ZIndex = 15,
-    }, false)
-    action.BackgroundColor3 = canJoin and JOIN_COLOR or HERE_COLOR
-    action.TextColor3 = canJoin and Color3.new(1, 1, 1) or THEME.muted
-    if canJoin then stroke(action, Color3.new(0, 0, 0), 2, 0.35) end
-
-    action.MouseButton1Click:Connect(function()
-        if isHere then
-            notify("you are already in this server", 3)
-            return
-        end
-        if not canJoin then
-            if entry.taken == true then
-                notify("this egg was already taken — tap REFRESH for a fresh list", 6)
-            elseif entry.full == true then
-                notify("that reported server is full — tap REFRESH for a fresh list", 6)
-            else
-                local _, why = jobShape(entry.jobId)
-                notify("this report cannot be joined: " .. tostring(why), 6)
-            end
-            return
-        end
-        local pending = pendingJoins[action]
-        if pending and os.clock() < pending.until_ then
-            pendingJoins[action] = nil
-            action.Text = "JOIN"
-            action.BackgroundColor3 = JOIN_COLOR
-            requestJoin(entry)
-            return
-        end
-        if CONFIG.AUTO_JOIN then
-            requestJoin(entry)
-            return
-        end
-        pendingJoins[action] = { until_ = os.clock() + 5 }
-        action.Text = "SURE?"
-        action.BackgroundColor3 = SURE_COLOR
-        notify("tap JOIN again to teleport to " .. shortId(entry.jobId), 5)
-    end)
-
-    return card
+    return bindCard(cardPool[index] or createCard(index), entry, index)
 end
+
+local function showInfo(titleText, bodyText)
+    if not UI.infoCard then
+        local root = make("Frame", { Name = "InfoPanel", Size = UDim2.new(1, -4, 0, 130), BackgroundColor3 = CARD_BG, BorderSizePixel = 0, LayoutOrder = 1, ZIndex = 14 }, UI.list)
+        corner(8, root); stroke(root, THEME.line, 1, 0.3)
+        local head = label(root, "", UDim2.fromOffset(12, 10), UDim2.new(1, -24, 0, 20), THEME.text, 14)
+        head.Font = Enum.Font.GothamBlack; head.Name = "InfoTitle"; head.ZIndex = 15
+        local body = label(root, "", UDim2.fromOffset(12, 35), UDim2.new(1, -24, 1, -45), THEME.muted, 10)
+        body.Name = "EmptyText"; body.TextWrapped = true; body.TextYAlignment = Enum.TextYAlignment.Top; body.ZIndex = 15
+        UI.infoCard = { root = root, head = head, body = body }
+    end
+    if UI.infoCard.root.Parent ~= UI.list then UI.infoCard.root.Parent = UI.list end
+    UI.infoCard.root.Visible = true
+    UI.infoCard.root.LayoutOrder = 1
+    UI.infoCard.head.Text, UI.infoCard.body.Text = titleText, bodyText
+end
+
 
 --==============================================================================
 -- EMPTY STATES  (always accurate, never invented data)
@@ -2026,41 +1917,54 @@ end
 --==============================================================================
 -- RENDER
 --==============================================================================
+local function historyBody()
+    if #STATE.history == 0 then return "No local M0x46 events yet.\n\nRefresh the live feed, use JOIN, or inspect a source error to populate this session history." end
+    local rows = {}
+    for index = 1, math.min(#STATE.history, 12) do
+        local event = STATE.history[index]
+        rows[#rows + 1] = string.format("[%s] %s", tostring(event.kind), tostring(event.text))
+    end
+    return table.concat(rows, "\n")
+end
+
+local function usersBody()
+    return table.concat({
+        "NYX servers: " .. tostring(NYX.servers),
+        "NYX participants: " .. tostring(NYX.participants),
+        "Remote servers in this feed: " .. tostring(STATE.remoteServers),
+        "Source: " .. tostring(STATE.feedSource or "none"),
+        "Pages read: " .. tostring(STATE.feedPages or 0),
+        "TTL: " .. tostring(NYX.ttlSeconds) .. "s",
+        "Current JobId remains excluded: " .. shortId(game.JobId),
+    }, "\n")
+end
+
 local function render()
     clearList()
-    local shown, matched = visibleList()
-    if STATE.tab == "all" then STATE.feedMatched = matched end
-
-    if #shown == 0 then
-        local holder = make("Frame", {
-            Name = "EmptyState", Size = UDim2.new(1, -6, 0, 122), BackgroundColor3 = CARD_BG,
-            BackgroundTransparency = 0.3, BorderSizePixel = 0, LayoutOrder = 1, ZIndex = 11,
-        }, list)
-        corner(8, holder)
-        stroke(holder, THEME.line, 1, 0.5)
-        local message = make("TextLabel", {
-            Name = "EmptyText", Text = emptyMessage(), Size = UDim2.new(1, -20, 1, -20),
-            Position = UDim2.fromOffset(10, 10), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
-            TextSize = 11, TextColor3 = THEME.muted, TextWrapped = true,
-            TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 12,
-        }, holder)
-        local _ = message
+    if STATE.view == "history" then
+        showInfo("SESSION HISTORY", historyBody())
         return
     end
-
-    for index = 1, #shown do
-        local card = makeCard(shown[index], index)
-        card.Parent = list
-        card.BackgroundTransparency = 1
-        TweenService:Create(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            BackgroundTransparency = 0.10,
-        }):Play()
+    if STATE.view == "users" then
+        showInfo("NYX NETWORK", usersBody())
+        return
     end
+    local shown, matched = visibleList()
+    if STATE.tab == "all" then
+        STATE.feedMatched = matched
+        STATE.statusCounts = STATUS.count(STATE.feed, NYX.now())
+    end
+    if UI.paintCounts then UI.paintCounts() end
+    if #shown == 0 then
+        showInfo(STATE.tab == "all" and "LIVE FEED" or "MY SERVER", emptyMessage())
+        if UI.infoCard then UI.infoCard.root.Name = "EmptyState" end
+        return
+    end
+    for index = 1, #shown do makeCard(shown[index], index) end
 end
 
 local function renderIfDirty()
-    if not panel.Visible then return end
-    if not STATE.dirty then return end
+    if not UI.panel.Visible or not STATE.dirty then return end
     STATE.dirty = false
     render()
 end
@@ -2088,19 +1992,48 @@ local function ingestScan()
         CAPS.moduleApi and "module api" or "attribute scan")
     markDirty()
     pcall(function()
-        gui:SetAttribute("M0x46Count", matched)
-        gui:SetAttribute("M0x46Raw", #entries)
-        gui:SetAttribute("M0x46Status", STATE.status)
-        gui:SetAttribute("M0x46Source", CAPS.moduleApi and "module" or "attributes")
+        UI.gui:SetAttribute("M0x46Count", matched)
+        UI.gui:SetAttribute("M0x46Raw", #entries)
+        UI.gui:SetAttribute("M0x46Status", STATE.status)
+        UI.gui:SetAttribute("M0x46Source", CAPS.moduleApi and "module" or "attributes")
     end)
     markDirty()
     return true
+end
+
+-- Fresh reports replace stale duplicate data by report time, never by the
+-- client's former claimStatus. If timestamps tie/missing, explicit feed state
+-- evidence wins over absent fields; only then does income break the tie.
+local function freshMillis(entry)
+    return tonumber(entry and entry.seenAt) or 0
+end
+
+local function hasStateEvidence(entry)
+    return entry and (entry.hasTakenFlag or entry.hasFullFlag or entry.hasUnavailableFlag) or false
+end
+
+local function shouldReplaceFresh(existing, incoming)
+    local oldAt, newAt = freshMillis(existing), freshMillis(incoming)
+    if newAt ~= oldAt then return newAt > oldAt end
+    local oldEvidence, newEvidence = hasStateEvidence(existing), hasStateEvidence(incoming)
+    if oldEvidence ~= newEvidence then return newEvidence end
+    -- For tied feed records, the later payload is treated as the authoritative
+    -- update; a lower rate is not a reason to retain a stale TAKEN/FULL state.
+    return true
+end
+
+local function copyFresh(existing, incoming)
+    for field, value in pairs(incoming) do existing[field] = value end
+    -- fresh server data intentionally clears only transient local claim marks
+    -- that could otherwise pin a card to a previous failed attempt.
+    existing.claimStatus, existing.claimDetail = nil, nil
 end
 
 local function ingestFeed()
     if STATE.feedBusy then return false end
     if not CAPS.network then
         STATE.feedError = "HTTP unavailable"
+        STATE.networkOnline = false
         STATE.feedLoaded = true
         markDirty()
         return false
@@ -2113,6 +2046,7 @@ local function ingestFeed()
     local remote = {}
     local total, remoteTotal = 0, 0
     local source, sourceError = nil, nil
+    local expiredRows = 0
 
     local function harvest(data)
         local added = 0
@@ -2120,24 +2054,22 @@ local function ingestFeed()
             local entry = normalizeFeedItem(raw, "nyx")
             if entry then
                 local isHere = entry.jobId == game.JobId
-                local expired = entry.expiresAt and entry.expiresAt > 0 and entry.expiresAt <= NYX.now()
-                -- A row is dropped only when it cannot be true any more:
-                --   1. it belongs to the server we are already standing in
-                --   2. its TTL has run out
-                -- Rows the network reports as full/claimed stay listed with a
-                -- FULL / TAKEN badge and no JOIN button — hiding them would hide
-                -- real reports, which this app never does.
-                if not (CONFIG.REMOTE_ONLY and isHere) and not expired then
+                local state = STATUS.of(entry, NYX.now())
+                -- Expired reports are never rendered or claimed. Confirmed FULL
+                -- and TAKEN stay visible as evidence; UNKNOWN never becomes TAKEN.
+                if state == "expired" then
+                    expiredRows = expiredRows + 1
+                elseif not (CONFIG.REMOTE_ONLY and isHere) then
                     local key = tostring(entry.uid) .. "|" .. tostring(entry.jobId)
                     local existing = seen[key]
                     if not existing then
                         seen[key] = entry
                         list[#list + 1] = entry
                         added = added + 1
-                    elseif (entry.rate or -1) > (existing.rate or -1) then
+                    elseif shouldReplaceFresh(existing, entry) then
                         -- `list` holds the first table, so update it in place;
-                        -- replacing only seen[key] would leave a stale card.
-                        for field, value in pairs(entry) do existing[field] = value end
+                        -- fresh status evidence must not be left on a stale card.
+                        copyFresh(existing, entry)
                     end
                     if type(entry.jobId) == "string" then remote[entry.jobId] = true end
                 end
@@ -2148,8 +2080,9 @@ local function ingestFeed()
 
     if CONFIG.NYX.ENABLED then
         local offset, pageIndex, lastError = 0, 0, nil
-        local nyxPages = math.max(1, tonumber(CONFIG.NYX.PAGES) or 1)
-        while pageIndex < nyxPages do
+        local normalPages = math.max(1, tonumber(CONFIG.NYX.PAGES) or 1)
+        local maxPages = math.max(normalPages, tonumber(CONFIG.NYX.MAX_PAGES) or normalPages)
+        while pageIndex < maxPages do
             local data, err = NYX.fetchPage(offset)
             if not data then lastError = err break end
             pageIndex = pageIndex + 1
@@ -2157,8 +2090,13 @@ local function ingestFeed()
             total = math.max(total, tonumber(data.total) or 0)
             local following = tonumber(data.nextOffset)
             if #(data.items or {}) == 0 or not following or following <= offset then break end
+            -- Always read the normal budget. After that, continue only if every
+            -- seen row is FULL/TAKEN/expired; this prevents the ALL-TAKEN first
+            -- pages from hiding a later joinable report without unbounded polling.
+            if pageIndex >= normalPages and (not CONFIG.NYX.EXPAND_UNAVAILABLE or NYX.hasActionable(list)) then break end
             offset = following
         end
+        STATE.feedPages = pageIndex
         if pageIndex > 0 then
             source = "nyx"
             if lastError then sourceError = tostring(lastError) end
@@ -2171,11 +2109,11 @@ local function ingestFeed()
         STATE.feedErrors = { nyx = sourceError }
         STATE.feedSource = source
         STATE.feedBusy = false
-        -- claimable rows first (a TAKEN/FULL row can never be joined), then by income
+        -- Never infer availability from a missing field: this status order puts
+        -- proven JOINABLE reports first, then UNKNOWN, then FULL and TAKEN.
         table.sort(list, function(a, b)
-            local aDead = (a.taken == true or a.full == true) and 1 or 0
-            local bDead = (b.taken == true or b.full == true) and 1 or 0
-            if aDead ~= bDead then return aDead < bDead end
+            local ar, br = STATUS.rank(a, NYX.now()), STATUS.rank(b, NYX.now())
+            if ar ~= br then return ar < br end
             return sortByValue(a, b)
         end)
         local cap = math.max(tonumber(CONFIG.FEED_LIMIT) or 40, 40)
@@ -2187,11 +2125,15 @@ local function ingestFeed()
         STATE.feedError = nil
         STATE.feedLoaded = true
         STATE.feedAt = os.clock()
-        STATE.feedMatched = 0
-        for _, entry in ipairs(list) do if passesFilter(entry) then STATE.feedMatched = STATE.feedMatched + 1 end end
+        STATE.feedExpired = expiredRows
+        STATE.statusCounts = STATUS.count(list, NYX.now())
+        STATE.feedMatched = STATE.statusCounts.joinable + STATE.statusCounts.taken
+            + STATE.statusCounts.full + STATE.statusCounts.unknown
+        STATE.networkOnline = true
         local more = STATE.feedTotal > #list and string.format(" · %d total", STATE.feedTotal) or ""
-        STATE.status = string.format("%d live%s · %d server(s) · NYX",
-            #list, more, STATE.remoteServers)
+        STATE.status = string.format("%d live%s · %d server(s) · NYX · J%d T%d F%d U%d",
+            #list, more, STATE.remoteServers, STATE.statusCounts.joinable,
+            STATE.statusCounts.taken, STATE.statusCounts.full, STATE.statusCounts.unknown)
         markDirty()
         return true
     end
@@ -2207,6 +2149,9 @@ local function ingestFeed()
         STATE.feedLoaded = true
         STATE.feedAt = os.clock()
         STATE.feedMatched = 0
+        STATE.feedExpired = expiredRows
+        STATE.statusCounts = { joinable = 0, taken = 0, full = 0, unknown = 0, expired = expiredRows }
+        STATE.networkOnline = source == "nyx" and not sourceError
         STATE.feedErrors = { nyx = sourceError }
         if source == "nyx" and not sourceError then
             STATE.feedSource = "nyx"
@@ -2232,6 +2177,7 @@ local function ingestFeed()
     local remote = {}
     local total, remoteTotal = 0, 0
     local lastError
+    local fallbackExpired = 0
 
     while pageIndex < pages do
         local data, err = fetchFeed(offset)
@@ -2247,18 +2193,21 @@ local function ingestFeed()
             local entry = normalizeFeedItem(raw, "own")
             if entry then
                 local isHere = entry.jobId == game.JobId
+                local state = STATUS.of(entry, STATUS.now())
                 -- defence in depth: even if the backend ignores excludeJob, our
                 -- own server must never appear under ALL SERVERS
-                if not (CONFIG.REMOTE_ONLY and isHere) then
+                if state == "expired" then
+                    fallbackExpired = fallbackExpired + 1
+                elseif not (CONFIG.REMOTE_ONLY and isHere) then
                     local key = tostring(entry.uid) .. "|" .. tostring(entry.jobId)
                     local existing = seen[key]
                     if not existing then
                         seen[key] = entry
                         list[#list + 1] = entry
-                    elseif (entry.rate or -1) > (existing.rate or -1) then
+                    elseif shouldReplaceFresh(existing, entry) then
                         -- `list` holds the first table, so update it in place;
-                        -- replacing only seen[key] would leave a stale card.
-                        for field, value in pairs(entry) do existing[field] = value end
+                        -- fresh status evidence must not be left on a stale card.
+                        copyFresh(existing, entry)
                     end
                     if type(entry.jobId) == "string" then remote[entry.jobId] = true end
                 end
@@ -2275,13 +2224,18 @@ local function ingestFeed()
         -- Both sources failed: keep the NYX reason, it is the interesting one.
         STATE.feedErrors = { nyx = sourceError, own = lastError }
         STATE.feedSource = nil
+        STATE.networkOnline = false
         STATE.feedError = sourceError or lastError or "invalid response"
         STATE.feedLoaded = true
         markDirty()
         return false
     end
 
-    table.sort(list, sortByValue)
+    table.sort(list, function(a, b)
+        local ar, br = STATUS.rank(a), STATUS.rank(b)
+        if ar ~= br then return ar < br end
+        return sortByValue(a, b)
+    end)
     STATE.feed = list
     STATE.feedTotal = total > 0 and total or #list
     STATE.remoteServers = 0
@@ -2290,8 +2244,11 @@ local function ingestFeed()
     STATE.feedError = nil
     STATE.feedLoaded = true
     STATE.feedAt = os.clock()
-    STATE.feedMatched = 0
-    for _, entry in ipairs(list) do if passesFilter(entry) then STATE.feedMatched = STATE.feedMatched + 1 end end
+    STATE.feedExpired = fallbackExpired
+    STATE.statusCounts = STATUS.count(list, STATUS.now())
+    STATE.feedMatched = STATE.statusCounts.joinable + STATE.statusCounts.taken
+        + STATE.statusCounts.full + STATE.statusCounts.unknown
+    STATE.networkOnline = pageIndex > 0
     STATE.feedErrors = { nyx = sourceError, own = lastError }
     if #list == 0 and source == "nyx" and not sourceError then
         -- NYX answered, but neither feed has a currently valid remote egg. Keep
@@ -2338,98 +2295,92 @@ end)
 -- UI BEHAVIOUR
 --==============================================================================
 local function paintTabs()
-    localTab.BackgroundColor3 = STATE.tab == "local" and THEME.accent or THEME.glass
-    feedTab.BackgroundColor3 = STATE.tab == "all" and THEME.accent or THEME.glass
-    localTab.TextColor3 = THEME.text
-    feedTab.TextColor3 = THEME.text
+    UI.localTab.BackgroundColor3 = STATE.tab == "local" and THEME.redDeep or THEME.panelHigh
+    UI.feedTab.BackgroundColor3 = STATE.tab == "all" and THEME.redDeep or THEME.panelHigh
+    UI.localTab.TextColor3, UI.feedTab.TextColor3 = THEME.text, THEME.text
+end
+
+local function paintSidebar()
+    local active = { logs = UI.logsButton, history = UI.historyButton, users = UI.usersButton }
+    for key, control in pairs(active) do
+        local on = STATE.view == key
+        control.BackgroundColor3 = on and THEME.redDeep or THEME.panelHigh
+        control.TextColor3 = on and THEME.text or THEME.muted
+    end
+end
+
+function UI.paintCounts()
+    local counts = STATE.statusCounts or {}
+    UI.countJoin.Text = "JOINABLE " .. tostring(counts.joinable or 0)
+    UI.countTaken.Text = "TAKEN " .. tostring(counts.taken or 0)
+    UI.countFull.Text = "FULL " .. tostring(counts.full or 0)
+    UI.countUnknown.Text = "UNKNOWN " .. tostring(counts.unknown or 0)
 end
 
 local function paintBroadcast()
-    broadcastButton.Text = CONFIG.BROADCAST and "BROADCAST: ON" or "BROADCAST: OFF"
-    broadcastButton.TextColor3 = CONFIG.BROADCAST and THEME.text or THEME.red
-    broadcastToggle.Text = CONFIG.BROADCAST and "BROADCAST: ON" or "BROADCAST: OFF"
-    broadcastToggle.BackgroundColor3 = CONFIG.BROADCAST and Color3.fromRGB(34, 128, 74) or Color3.fromRGB(140, 44, 50)
+    UI.broadcastToggle.Text = CONFIG.BROADCAST and "BROADCAST: ON" or "BROADCAST: OFF"
+    UI.broadcastToggle.BackgroundColor3 = CONFIG.BROADCAST and Color3.fromRGB(22, 94, 48) or THEME.redDeep
 end
 
-local function paintAutoJoin()
-    autoJoinToggle.Text = CONFIG.AUTO_JOIN and "AUTO JOIN: ON" or "AUTO JOIN: OFF"
-    autoJoinToggle.BackgroundColor3 = CONFIG.AUTO_JOIN and Color3.fromRGB(34, 128, 74) or THEME.glass
+local function paintAutos()
+    UI.autoJoinToggle.Text = CONFIG.AUTO_JOIN and "AUTO-JOIN: ON" or "AUTO-JOIN: OFF"
+    UI.autoJoinToggle.BackgroundColor3 = CONFIG.AUTO_JOIN and Color3.fromRGB(22, 94, 48) or THEME.panelHigh
+    UI.autoForceToggle.Text = CONFIG.AUTO_FORCE and "AUTO-FORCE: ON" or "AUTO-FORCE: OFF"
+    UI.autoForceToggle.BackgroundColor3 = CONFIG.AUTO_FORCE and THEME.redDeep or THEME.panelHigh
 end
 
 local function paintFilter()
     local spec = FILTERS[STATE.filterIndex]
-    filterButton.Text = "RARITY: " .. string.upper(spec.name)
+    UI.filterButton.Text = "RARITY: " .. string.upper(spec.name)
     local rarity = RARITY_BY_NAME[spec.name:lower()]
-    filterButton.TextColor3 = rarity and rarity.color or THEME.muted
+    UI.filterButton.TextColor3 = rarity and rarity.color or THEME.muted
+end
+
+local function paintOverlayInfo()
+    local counts = STATE.statusCounts or {}
+    UI.infoRow.Text = table.concat({
+        "NYX source: " .. tostring(STATE.feedSource or "not selected"),
+        "NYX endpoint: " .. tostring(NYX.endpoint or "runtime config not read"),
+        "NYX network: " .. tostring(NYX.servers) .. " server(s), " .. tostring(NYX.participants) .. " participant(s), ttl " .. tostring(NYX.ttlSeconds) .. "s",
+        "NYX pages: " .. tostring(STATE.feedPages or 0) .. "  •  expired dropped: " .. tostring(STATE.feedExpired or 0),
+        "Counts: JOINABLE " .. tostring(counts.joinable or 0) .. " | TAKEN " .. tostring(counts.taken or 0) .. " | FULL " .. tostring(counts.full or 0) .. " | UNKNOWN " .. tostring(counts.unknown or 0),
+        "NYX error: " .. tostring(STATE.feedErrors and STATE.feedErrors.nyx or "none"),
+        "Own fallback: " .. tostring(rawEndpoint()),
+        "Own error: " .. tostring(STATE.feedErrors and STATE.feedErrors.own or "none"),
+        "Current JobId excluded: " .. shortId(game.JobId),
+        "Local scanner: " .. (CAPS.moduleApi and "game module" or "attribute fallback"),
+        "Auth keys are never displayed. FORCE skips only this app's preflight; Roblox still decides access.",
+        DIAG.problem and ("Backend note: " .. tostring(DIAG.problem)) or "",
+    }, "\n")
 end
 
 local function applyFilters(reason)
-    -- Local/own-backend rows are re-filtered instantly. NYX also receives the
-    -- changed floor/rank server-side, so refresh it once when ALL SERVERS is open.
     markDirty()
-    local shown, matched = visibleList()
-    if reason then
-        notify(string.format("%d shown (≥%s, %s+)", matched, moneyFilter(STATE.minRate), rarityName(STATE.minRank)), 3)
-    end
+    local _, matched = visibleList()
+    if reason then notify(string.format("%d shown (≥%s, %s+)", matched, moneyFilter(STATE.minRate), rarityName(STATE.minRank)), 3) end
     renderIfDirty()
     if STATE.tab == "all" then refreshFeed() end
 end
 
 local function setTab(key)
-    if STATE.tab == key then
-        if key == "all" then refreshFeed() end
-        return
-    end
     STATE.tab = key
-    paintTabs()
-    markDirty()
-    render()
-    if key == "all" then refreshFeed() end
+    STATE.view = "logs"
+    paintTabs(); paintSidebar(); markDirty()
+    if UI.panel.Visible then render() end
+    if key == "all" then refreshFeed() else refreshLocal() end
 end
 
-localTab.MouseButton1Click:Connect(function() setTab("local") end)
-feedTab.MouseButton1Click:Connect(function() setTab("all") end)
-
-filterButton.MouseButton1Click:Connect(function()
-    STATE.filterIndex = STATE.filterIndex % #FILTERS + 1
-    local spec = FILTERS[STATE.filterIndex]
-    STATE.minRank = spec.rank
-    paintFilter()
-    applyFilters(true)
-end)
-
-refreshButton.MouseButton1Click:Connect(function()
-    notify("scanning…", 2)
-    refreshLocal()
-    if STATE.tab == "all" then refreshFeed() end
-    local shown, matched = visibleList()
-    notify(string.format("%d egg(s) match (≥%s, %s+)", matched, moneyFilter(STATE.minRate), rarityName(STATE.minRank)), 4)
-    local _ = shown -- kept for debugging in the console
-end)
-
-broadcastButton.MouseButton1Click:Connect(function()
-    CONFIG.BROADCAST = not CONFIG.BROADCAST
-    paintBroadcast()
-    notify(CONFIG.BROADCAST and "broadcasting enabled" or "broadcasting paused")
-end)
-
-settingsButton.MouseButton1Click:Connect(function()
-    overlay.Visible = not overlay.Visible
-    if overlay.Visible then paintOverlayInfo() end
-end)
-overlayClose.MouseButton1Click:Connect(function() overlay.Visible = false end)
-
-broadcastToggle.MouseButton1Click:Connect(function()
-    CONFIG.BROADCAST = not CONFIG.BROADCAST
-    paintBroadcast()
-    notify(CONFIG.BROADCAST and "broadcasting enabled" or "broadcasting paused")
-end)
-
-autoJoinToggle.MouseButton1Click:Connect(function()
-    CONFIG.AUTO_JOIN = not CONFIG.AUTO_JOIN
-    paintAutoJoin()
-    notify(CONFIG.AUTO_JOIN and "JOIN teleports immediately" or "JOIN now asks SURE? first")
-end)
+local function setView(key)
+    if key == "settings" then
+        UI.overlay.Visible = not UI.overlay.Visible
+        if UI.overlay.Visible then paintOverlayInfo() end
+        return
+    end
+    STATE.view = key
+    paintSidebar()
+    markDirty()
+    renderIfDirty()
+end
 
 -- income box: parse "1B", "250M", "0", "off", "1.5b"
 local function parseIncome(text)
@@ -2438,36 +2389,104 @@ local function parseIncome(text)
     local amount, suffix = clean:match("^([%d%.]+)([kmbtq]?)")
     local value = tonumber(amount)
     if not value then return nil end
-    local multiplier = ({ k = 1e3, m = 1e6, b = 1e9, t = 1e12, q = 1e15 })[suffix] or 1
-    return value * multiplier
+    return value * (({ k = 1e3, m = 1e6, b = 1e9, t = 1e12, q = 1e15 })[suffix] or 1)
 end
 
 local function applyIncomeBox(silent)
-    local value = parseIncome(rateBox.Text)
+    local value = parseIncome(UI.rateBox.Text)
     if not value then
-        rateBox.Text = moneyFilter(STATE.minRate)
-        notify("income must look like 1B, 250M or 0 (off)", 5)
+        UI.rateBox.Text = moneyFilter(STATE.minRate)
+        notify("income must look like 1B, 250M or 0", 5)
         return
     end
     STATE.minRate = clamp(value, 0, 1e13)
-    rateBox.Text = moneyFilter(STATE.minRate)
+    UI.rateBox.Text = moneyFilter(STATE.minRate)
     applyFilters(not silent)
 end
 
-rateBox.FocusLost:Connect(function() applyIncomeBox(false) end)
-rateBox:GetPropertyChangedSignal("Text"):Connect(function()
-    -- live update while typing, but only for a complete, valid number
-    if parseIncome(rateBox.Text) ~= nil then
-        STATE.minRate = clamp(parseIncome(rateBox.Text), 0, 1e13)
-        markDirty()
-        renderIfDirty()
+-- Explicitly armed automation: AUTO-JOIN still requires a source preflight;
+-- AUTO-FORCE is enabled only by a second arm tap and only targets JOINABLE rows.
+local function attemptAuto()
+    if not UI.panel.Visible or STATE.tab ~= "all" or (not CONFIG.AUTO_JOIN and not CONFIG.AUTO_FORCE) then return end
+    if os.clock() < (STATE.autoNext or 0) then return end
+    for _, entry in ipairs(STATE.feed or {}) do
+        local key = tostring(entry.source) .. "|" .. tostring(entry.uid) .. "|" .. tostring(entry.jobId)
+        if STATUS.of(entry, NYX.now()) == "joinable" and actionAllowed(entry) and not STATE.autoSeen[key] then
+            STATE.autoSeen[key], STATE.autoNext = true, os.clock() + 5
+            if CONFIG.AUTO_FORCE then
+                NYX.note("AUTO-FORCE", "confirmation requested for " .. tostring(entry.name) .. " in " .. shortId(entry.jobId))
+                openForceConfirm(entry, true)
+            else
+                NYX.note("AUTO-JOIN", "preflighting " .. tostring(entry.name) .. " in " .. shortId(entry.jobId))
+                task.spawn(function() requestJoin(entry) end)
+            end
+            return
+        end
+    end
+end
+
+UI.logsButton.MouseButton1Click:Connect(function() setView("logs") end)
+UI.historyButton.MouseButton1Click:Connect(function() setView("history") end)
+UI.usersButton.MouseButton1Click:Connect(function() setView("users") end)
+UI.settingsButton.MouseButton1Click:Connect(function() setView("settings") end)
+UI.overlayClose.MouseButton1Click:Connect(function() UI.overlay.Visible = false end)
+UI.localTab.MouseButton1Click:Connect(function() setTab("local") end)
+UI.feedTab.MouseButton1Click:Connect(function() setTab("all") end)
+
+UI.filterButton.MouseButton1Click:Connect(function()
+    STATE.filterIndex = STATE.filterIndex % #FILTERS + 1
+    STATE.minRank = FILTERS[STATE.filterIndex].rank
+    paintFilter(); applyFilters(true)
+end)
+UI.refreshButton.MouseButton1Click:Connect(function()
+    refreshLocal()
+    if STATE.tab == "all" then refreshFeed() end
+    notify("refresh requested", 3)
+end)
+UI.clearButton.MouseButton1Click:Connect(function()
+    STATE.history = {}
+    notify("session history cleared; live reports remain real", 3)
+    if STATE.view == "history" then markDirty(); renderIfDirty() end
+end)
+UI.broadcastToggle.MouseButton1Click:Connect(function()
+    CONFIG.BROADCAST = not CONFIG.BROADCAST
+    paintBroadcast()
+    notify(CONFIG.BROADCAST and "broadcast enabled" or "broadcast paused", 3)
+end)
+UI.autoJoinToggle.MouseButton1Click:Connect(function()
+    CONFIG.AUTO_JOIN = not CONFIG.AUTO_JOIN
+    if CONFIG.AUTO_JOIN then
+        CONFIG.AUTO_FORCE = false
+        STATE.autoSeen = {}
+    end
+    paintAutos()
+    notify(CONFIG.AUTO_JOIN and "AUTO-JOIN armed: source preflight remains mandatory" or "AUTO-JOIN off", 5)
+end)
+UI.autoForceToggle.MouseButton1Click:Connect(function()
+    if CONFIG.AUTO_FORCE then
+        CONFIG.AUTO_FORCE = false
+        paintAutos(); notify("AUTO-FORCE prompt mode off", 4); return
+    end
+    if os.clock() < (STATE.forceArmUntil or 0) then
+        CONFIG.AUTO_FORCE, CONFIG.AUTO_JOIN, STATE.forceArmUntil = true, false, nil
+        STATE.autoSeen = {}
+        paintAutos(); notify("AUTO-FORCE prompt mode armed; every teleport still needs CONFIRM FORCE", 7)
+    else
+        STATE.forceArmUntil = os.clock() + 5
+        UI.autoForceToggle.Text = "ARM FORCE?"
+        notify("tap AUTO-FORCE again to arm prompt mode; it never bypasses confirmation", 5)
     end
 end)
-
-for _, preset in ipairs(presetButtons) do
+UI.rateBox.FocusLost:Connect(function() applyIncomeBox(false) end)
+UI.rateBox:GetPropertyChangedSignal("Text"):Connect(function()
+    if parseIncome(UI.rateBox.Text) ~= nil then
+        STATE.minRate = clamp(parseIncome(UI.rateBox.Text), 0, 1e13)
+        markDirty()
+    end
+end)
+for _, preset in ipairs(UI.presetButtons) do
     preset.button.MouseButton1Click:Connect(function()
-        STATE.minRate = preset.value
-        rateBox.Text = moneyFilter(STATE.minRate)
+        STATE.minRate, UI.rateBox.Text = preset.value, moneyFilter(preset.value)
         applyFilters(true)
     end)
 end
@@ -2475,130 +2494,94 @@ end
 --==============================================================================
 -- MINIMISE / REOPEN / CLOSE
 --==============================================================================
-local function fadePanel(target, visible)
-    if visible then
-        panel.Visible = true
-        panelScale.Scale = 0.96
-        TweenService:Create(panelScale, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = 1 }):Play()
-        render()
-    else
-        local tween = TweenService:Create(panelScale, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.96 })
-        tween.Completed:Connect(function() panel.Visible = false; panelScale.Scale = 1 end)
-        tween:Play()
-    end
-    launcher.Visible = not visible
-    if target then target.Visible = true end
-end
-
 local function openPanel()
-    if panel.Visible then return end
-    clampPanel()
-    fadePanel(nil, true)
-    paintTabs()
+    if UI.panel.Visible then return end
+    UI.applyLayout()
+    UI.panel.Visible, UI.launcher.Visible = true, false
+    paintTabs(); paintSidebar(); UI.paintCounts(); render()
+    if STATE.tab == "all" then refreshFeed() end
 end
 
 local function minimizePanel()
-    if not panel.Visible then return end
-    fadePanel(nil, false)
+    if not UI.panel.Visible then return end
+    UI.forceEntry, UI.forceModal.Visible = nil, false
+    UI.panel.Visible, UI.launcher.Visible = false, true
 end
 
 local function closeScript()
     notify("M0x46 unloaded", 2)
-    pcall(function() gui:Destroy() end)
+    pcall(function() UI.gui:Destroy() end)
 end
 
-launcher.MouseButton1Click:Connect(function()
-    if panel.Visible then minimizePanel() else openPanel() end
+UI.launcher.MouseButton1Click:Connect(function()
+    if UI.panel.Visible then minimizePanel() else openPanel() end
 end)
-minimizeButton.MouseButton1Click:Connect(minimizePanel)
-closeButton.MouseButton1Click:Connect(closeScript)
-
+UI.hideButton.MouseButton1Click:Connect(minimizePanel)
+UI.closeButton.MouseButton1Click:Connect(closeScript)
 UserInputService.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    if input.KeyCode == CONFIG.HOTKEY then
-        if panel.Visible then minimizePanel() else openPanel() end
-    end
+    if processed or input.KeyCode ~= CONFIG.HOTKEY then return end
+    if UI.panel.Visible then minimizePanel() else openPanel() end
 end)
 
 --==============================================================================
--- MAIN LOOP  (one coroutine for scan, broadcast, feed and UI text)
+-- MAIN LOOP  (one lightweight scheduler; no RenderStepped loop)
 --==============================================================================
-local loop = {
-    nextScan = 0,
-    nextReport = 0,
-    nextFeed = 0,
-    lastBroadcast = nil,
-}
+local loop = { nextScan = 0, nextReport = 0, nextFeed = 0, lastBroadcast = nil }
 
 local function updateStatusLine()
-    if overlay.Visible then paintOverlayInfo() end
+    if UI.overlay.Visible then paintOverlayInfo() end
     local line = STATE.status
     if STATE.notice and os.clock() < STATE.noticeUntil then line = STATE.notice end
-    if DIAG.problem then
-        statusText.Text = "⚠ BACKEND — see ALL SERVERS tab"
-        statusText.TextColor3 = THEME.red
-        return
-    end
-    statusText.Text = tostring(STATE.reportStatus) .. "  ·  " .. tostring(line)
     if STATE.feedError then
-        -- surface the actual failure in the header, where it is impossible to miss
-        statusText.Text = "⚠ " .. tostring(describeError(STATE.feedError))
-        statusText.TextColor3 = THEME.amber
+        UI.statusText.Text = "⚠ " .. tostring(describeError(STATE.feedError))
+        UI.statusText.TextColor3 = THEME.amber
+        UI.connectionDot.BackgroundColor3, UI.launcherDot.BackgroundColor3 = THEME.redHot, THEME.redHot
+        UI.connectionLabel.Text, UI.connectionLabel.TextColor3 = "OFFLINE", THEME.redHot
+    elseif STATE.networkOnline then
+        UI.statusText.Text = tostring(line)
+        UI.statusText.TextColor3 = THEME.green
+        UI.connectionDot.BackgroundColor3, UI.launcherDot.BackgroundColor3 = THEME.green, THEME.green
+        UI.connectionLabel.Text, UI.connectionLabel.TextColor3 = "CONNECTED", THEME.green
     else
-        statusText.TextColor3 = THEME.cyan
+        UI.statusText.Text = tostring(line)
+        UI.statusText.TextColor3 = THEME.muted
+        UI.connectionDot.BackgroundColor3, UI.launcherDot.BackgroundColor3 = THEME.amber, THEME.amber
+        UI.connectionLabel.Text, UI.connectionLabel.TextColor3 = "CHECKING", THEME.amber
     end
+    UI.paintCounts()
 end
 
-local function updateReset()
-    local cycle = cycleInfo()
-    if cycle and validNumber(cycle.remaining) then
-        local seconds = math.max(0, math.ceil(cycle.remaining))
-        resetLabel.Text = cycle.running == false and "PAUSED"
-            or string.format("%02d:%02d", math.floor(seconds / 60), seconds % 60)
-        resetLabel.TextColor3 = seconds <= 60 and THEME.red or seconds <= 150 and THEME.amber or THEME.muted
-    else
-        resetLabel.Text = "--:--"
-        resetLabel.TextColor3 = THEME.muted
-    end
-end
-
-local function expirePendingJoins()
-    for button, pending in pairs(pendingJoins) do
-        if not button.Parent then
-            pendingJoins[button] = nil
-        elseif os.clock() >= pending.until_ then
-            button.Text = "JOIN"
-            button.BackgroundColor3 = JOIN_COLOR
-            pendingJoins[button] = nil
+local function expirePendingActions()
+    for _, slot in ipairs(pendingActions) do
+        if slot.pending and os.clock() >= (slot.pendingUntil or 0) then
+            slot.pending = nil
+            markDirty()
         end
+    end
+    if STATE.forceArmUntil and os.clock() >= STATE.forceArmUntil then
+        STATE.forceArmUntil = nil
+        paintAutos()
     end
 end
 
 task.spawn(function()
-    -- first data pull immediately, then follow the schedule
     ingestScan()
-    loop.nextScan = os.clock() + CONFIG.SCAN_EVERY
-    loop.nextFeed = os.clock()
-
-    while gui.Parent do
+    loop.nextScan, loop.nextFeed = os.clock() + CONFIG.SCAN_EVERY, os.clock()
+    while UI.gui.Parent do
         local now = os.clock()
-        local interval = panel.Visible and CONFIG.SCAN_EVERY or CONFIG.HIDDEN_SCAN_EVERY
-
+        local scanInterval = UI.panel.Visible and CONFIG.SCAN_EVERY or CONFIG.HIDDEN_SCAN_EVERY
         if now >= loop.nextScan then
             ingestScan()
-            loop.nextScan = now + interval
+            loop.nextScan = now + scanInterval
         end
-
-        -- broadcast: only when something changed, or every 15 s as a keep-alive
         if CONFIG.BROADCAST and #STATE.raw > 0 and now >= loop.nextReport then
             local signature = tostring(#STATE.raw) .. ":" .. tostring(STATE.raw[1] and STATE.raw[1].uid)
             if signature ~= loop.lastBroadcast or now >= loop.nextReport + 10 then
-                loop.lastBroadcast = signature
-                loop.nextReport = now + CONFIG.REPORT_EVERY
+                loop.lastBroadcast, loop.nextReport = signature, now + CONFIG.REPORT_EVERY
                 local data, err = broadcast(STATE.raw)
                 if data then
                     STATE.reportStatus = string.format("shared %d", tonumber(data.accepted) or 0)
-                    pcall(function() gui:SetAttribute("M0x46Reported", tonumber(data.accepted) or 0) end)
+                    pcall(function() UI.gui:SetAttribute("M0x46Reported", tonumber(data.accepted) or 0) end)
                 elseif err and err ~= "busy" then
                     STATE.reportStatus = describeError(err)
                 end
@@ -2606,13 +2589,10 @@ task.spawn(function()
                 loop.nextReport = now + CONFIG.REPORT_EVERY
             end
         end
-
-        -- feed: only while ALL SERVERS is actually on screen. The shared feed is
-        -- polled slightly faster than the own backend because NYX reports expire
-        -- in ~90 s and a stale list means a wasted teleport.
-        if STATE.tab == "all" and panel.Visible and now >= loop.nextFeed then
-            loop.nextFeedInterval = CONFIG.NYX.ENABLED and math.min(CONFIG.FEED_EVERY, 5) or CONFIG.FEED_EVERY
-            loop.nextFeed = now + (loop.nextFeedInterval or CONFIG.FEED_EVERY)
+        -- Sensible refresh: NYX advertises a short TTL, but the UI only polls
+        -- while visible and only once per 5 seconds (or the configured slower rate).
+        if STATE.tab == "all" and UI.panel.Visible and now >= loop.nextFeed then
+            loop.nextFeed = now + (CONFIG.NYX.ENABLED and math.min(CONFIG.FEED_EVERY, 5) or CONFIG.FEED_EVERY)
             if not feedInFlight then
                 feedInFlight = true
                 task.spawn(function()
@@ -2621,66 +2601,38 @@ task.spawn(function()
                 end)
             end
         end
-
-        expirePendingJoins()
+        attemptAuto()
+        expirePendingActions()
         updateStatusLine()
-        if panel.Visible then
-            updateReset()
-            renderIfDirty()
-        end
-
+        if UI.panel.Visible then renderIfDirty() end
         task.wait(CONFIG.UI_TICK)
     end
 end)
 
-gui.Destroying:Connect(function()
-    for _, tween in ipairs(starTweens) do pcall(function() tween:Cancel() end) end
-    clearGradients()
-end)
+UI.gui.Destroying:Connect(function() end)
 
 --==============================================================================
 -- BOOT
 --==============================================================================
-clampPanel()
-clampLauncher()
+UI.applyLayout()
 probeApiBase()
 paintTabs()
+paintSidebar()
 paintBroadcast()
-paintAutoJoin()
+paintAutos()
 paintFilter()
 paintOverlayInfo()
-render()
-panelScale.Scale = 1
-log("M0x46 Finder v2.3 loaded — hotkey", CONFIG.HOTKEY.Name,
+UI.paintCounts()
+UI.panelScale.Scale = 1
+log("M0x46 Finder v2.4 loaded — hotkey", CONFIG.HOTKEY.Name,
     "| source:", CAPS.moduleApi and "module" or "attributes")
 
--- loud, actionable warnings instead of silent zeroes
 if not CAPS.network then
     log("WARNING: this executor exposes no HTTP function — ALL SERVERS is disabled")
-else
-    local endpoint = rawEndpoint()
-    if endpoint:find("127%.0%.0%.1") or endpoint:find("localhost") then
-        log("WARNING: ENDPOINT is the local default (" .. endpoint .. ") — the game cannot reach your PC.")
-    elseif CONFIG.ROOM_KEY == "changeme" then
-        log("WARNING: ROOM_KEY is still 'changeme' — set it to the value you started the server with")
-    end
-    local key = tostring(CONFIG.ROOM_KEY or "")
-    if key:find('"') or key:find("'") then
-        log("WARNING: ROOM_KEY contains quote characters — write ROOM_KEY = \"value\" once, not escaped quotes")
-    elseif key:find("=") then
-        log("WARNING: ROOM_KEY looks like a pasted assignment ('ROOM_KEY=...') — keep only the value")
-    end
-    if key:find("^#") then
-        log("WARNING: ROOM_KEY starts with '#' — that is the .env comment marker; the server's real key does not have it")
-    end
-    if DIAG.problem then log("WARNING: " .. DIAG.problem) end
-    local basePath = basePathOf(rawEndpoint())
-    if basePath ~= "" and basePath ~= "/" then
-        log("WARNING: ENDPOINT ends with the path '" .. basePath
-            .. "' — the backend serves /v1/* at the host root, so calls become "
-            .. basePath .. "/v1/eggs and return 404. Use the bare host.")
-    end
+elseif DIAG.problem then
+    log("WARNING: " .. DIAG.problem)
 end
+
 
 -- Test/observer handle. Read-only mirror of the live state so an external harness
 -- can assert on provenance (which feed answered) without scraping the UI.
@@ -2694,6 +2646,9 @@ _G.M0x46_DIAG = setmetatable({}, {
         if key == "nyxServers" then return NYX.servers end
         if key == "nyxParticipants" then return NYX.participants end
         if key == "rows" then return STATE.feed and #STATE.feed or 0 end
+        if key == "counts" then return STATE.statusCounts end
+        if key == "feedPages" then return STATE.feedPages end
+        if key == "expiredRows" then return STATE.feedExpired end
         if key == "remoteServers" then return STATE.remoteServers end
         if key == "status" then return STATE.status end
         if key == "feedErrors" then return STATE.feedErrors end
@@ -2705,6 +2660,13 @@ _G.M0x46_DIAG = setmetatable({}, {
             return nil
         end
         if key == "claim" then return NYX.claimRemote end
+        -- Read-only simulation helpers used only by test_runtime.py. They do
+        -- not trigger HTTP, claims, teleports, or expose room credentials.
+        if key == "normalize" then return normalizeFeedItem end
+        if key == "statusOf" then return STATUS.of end
+        if key == "claimVerdict" then return NYX.claimVerdict end
+        if key == "shouldReplaceFresh" then return shouldReplaceFresh end
+        if key == "forceModal" then return UI.forceModal end
         return nil
     end,
 })
