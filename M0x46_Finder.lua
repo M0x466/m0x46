@@ -53,7 +53,7 @@
 local CONFIG = {
     -- Your established X-Egg-Room backend remains the optional fallback.
     -- NYX is tried first; its separate credential is NEVER stored in this file.
-    ENDPOINT = "https://m0x46-xm0emjn7.back4.app/", -- own backend, no trailing slash
+    ENDPOINT = "https://m0x46-xm0emjn7.back4.app", -- own backend, no trailing slash
     ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI", -- must equal your backend ROOM_KEY
 
     HOTKEY = Enum.KeyCode.RightControl,
