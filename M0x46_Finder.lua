@@ -714,8 +714,15 @@ local function label(parent, text, position, size, color, textSize)
 end
 
 local function button(parent, props, accent)
-    local object = make("TextButton", props, parent)
-    corner(props.CornerRadius or 8, object)
+    -- CornerRadius is a helper option, not a TextButton property.
+    -- Applying it via make() would throw before the launcher could appear.
+    local radius = props.CornerRadius or 8
+    local buttonProps = {}
+    for key, value in pairs(props) do
+        if key ~= "CornerRadius" then buttonProps[key] = value end
+    end
+    local object = make("TextButton", buttonProps, parent)
+    corner(radius, object)
     object.BackgroundColor3 = accent and THEME.accent or THEME.glass
     object.BackgroundTransparency = accent and 0.05 or 0.12
     object.TextColor3 = THEME.text
@@ -745,7 +752,8 @@ local gui = make("ScreenGui", {
 local function viewport()
     local ok, camera = pcall(function() return workspace.CurrentCamera end)
     local size = ok and camera and camera.ViewportSize
-    if type(size) == "table" and (size.X or 0) > 0 and (size.Y or 0) > 0 then
+    -- Roblox ViewportSize is a Vector2, not a Lua table.
+    if size and size.X and size.Y and size.X > 0 and size.Y > 0 then
         return size.X, size.Y
     end
     return 1280, 720
@@ -1133,11 +1141,11 @@ do
     end)
 end
 
-if type(workspace.CurrentCamera) == "table" or type(workspace.CurrentCamera) == "userdata" then
+if workspace.CurrentCamera then
     pcall(function()
         workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            -- render() is defined later; main loop redraws after markDirty().
             applyLayout()
-            render()
         end)
     end)
 end
@@ -1224,6 +1232,9 @@ local function makeRow(parent, order, height)
         BackgroundTransparency = 1, LayoutOrder = order, ZIndex = 12,
     }, parent)
 end
+
+-- Forward declaration: JOIN callbacks are created here, before its implementation.
+local requestJoin
 
 local function makeCard(entry, index)
     local spec = raritySpec(entry)
@@ -1399,9 +1410,9 @@ local function emptyMessage()
     if STATE.tab == "local" then
         if STATE.scanned == 0 then
             return "No field eggs detected in this server.\n\n"
-                .. (CAPS.moduleApi and "The game module is loaded but returned nothing — '
-                    .. 'eggs may not have spawned yet." or "Fallback attribute scan found nothing. '
-                    .. 'If eggs are visible in game, send me the workspace folder names.")
+                .. (CAPS.moduleApi
+                    and "The game module is loaded but returned nothing — eggs may not have spawned yet."
+                    or "Fallback attribute scan found nothing. If eggs are visible in game, check the workspace folder names.")
         end
         local matched = 0
         for _, entry in ipairs(STATE.raw) do if passesFilter(entry) then matched = matched + 1 end end
@@ -1580,7 +1591,7 @@ end
 --==============================================================================
 -- JOIN
 --==============================================================================
-local function requestJoin(entry)
+requestJoin = function(entry)
     if not validJobId(entry.jobId) then
         notify("no valid JobId for this egg", 5)
         return false
