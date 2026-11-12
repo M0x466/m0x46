@@ -1,39 +1,45 @@
 --[[
 ================================================================================
-  M0x46 FINDER  ·  v1.0  ·  owner build
+  M0x46 FINDER  ·  v2.0  ·  owner build
 ================================================================================
-  A full rewrite of the "UNKNOWN / NYX Spawn Panel" architecture, owned by you.
+  A rewrite of the "UNKNOWN / NYX Spawn Panel" architecture, owned by you.
 
   Two ways to run it
-    1) paste the whole file into Delta → Execute   (works offline, no hosting)
+    1) paste the whole file into Delta -> Execute   (works offline, no hosting)
     2) host it on a URL you control and run the 3-line loader:
          loadstring(game:HttpGet("https://YOUR-HOST/M0x46_Finder.lua"))()
        Do not use a raw.githubusercontent.com URL you do not own — you cannot
        edit it without pushing a commit, and a takedown kills every user at once.
 
-  Differences from the script this is based on
-    • no key system, no /validate endpoint, no obfuscated remote loadstring
-    • nothing is fetched and executed at runtime — this file IS the script
-    • one config block at the top, one endpoint you control
-    • read-only by default: it never moves your character unless you set
-      CONFIG.AUTO_JOIN = true and press JOIN yourself
-
   What it does
-    • reads the eggs currently spawned in your server (field scan)
-    • renders them as glass cards: rank, name, rarity, income/s, weight or ×scale,
-      mutation glyphs, and a JOIN button
-    • ALL SERVERS tab: ranked feed of every egg from every server on YOUR backend
-    • broadcasts your sightings to YOUR backend (X-M0x46-Room header)
-    • optional Auto Join: claims a server on your backend, then teleports you
+    • scans the eggs currently spawned in your server (game module, else attrs)
+    • MY SERVER  : only eggs physically detected in THIS server, filtered live
+    • ALL SERVERS: only real eggs reported to YOUR backend by other servers
+    • JOIN       : real TeleportService join, only with a valid foreign JobId
+
+  Guarantees
+    • no key system, no /validate, no obfuscated remote loadstring
+    • nothing is fetched and executed at runtime — this file IS the script
+    • never fabricates eggs, servers or income: an empty backend shows as empty
+    • read-only: it does not move your character unless you press JOIN
+
+  Data flow (single source of truth)
+      scanOnce()  -> STATE.raw     (deduped, unfiltered, sorted)
+      fetchFeed() -> STATE.feed    (unfiltered — the backend returns everything)
+                          │
+                          └─ visibleList() applies min income + min rarity
+                             EVERY render. Filters never mutate raw/feed, so
+                             changing a filter can always show more again.
+
+  Backend contract (eggfinder-server/server.js in this workspace)
+    POST /v1/report  {placeId, jobId, reporterId, ttl, eggs[]}   header X-Egg-Room
+    GET  /v1/eggs    ?placeId&localJob&limit&offset&minRate&minRank&all=1
+    POST /v1/join    {placeId, jobId, uid, reporterId}
+    Custom headers for your own server: X-Egg-Room  (also sends X-M0x46-Room)
 
   Game bridge
     Primary  : ReplicatedStorage.Client.EggState.ReadFieldEggs() + Data.Assets
     Fallback : attribute scan of workspace.AreaEggSlotsClient (see SCHEMA)
-
-  Backend contract (eggfinder-server/server.js in this workspace)
-    POST /v1/report  {placeId, jobId, reporterId, ttl, eggs[]}
-    GET  /v1/eggs    ?placeId&localJob&limit&offset&minRate&minRank&all=1
-    POST /v1/join    {placeId, jobId, uid, reporterId}
 ================================================================================
 ]]
 
@@ -42,37 +48,45 @@
 --==============================================================================
 local CONFIG = {
     ENDPOINT = "https://m0x46-iqjlgk34.back4.app",   -- your backend, no trailing slash
-    ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI",                -- must equal ROOM_KEY on the server             
+    ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI",                -- must equal ROOM_KEY on the server
 
     HOTKEY = Enum.KeyCode.RightControl,
-    SCAN_EVERY = 1,                       -- seconds between field scans
-    REPORT_EVERY = 5,                     -- seconds between broadcasts
-    FEED_EVERY = 6,                       -- seconds between feed refreshes
+
+    -- loop cadence (seconds)
+    SCAN_EVERY = 1,                       -- field scan while the panel is open
+    HIDDEN_SCAN_EVERY = 5,                -- field scan while minimised (saves FPS)
+    REPORT_EVERY = 5,                     -- broadcast to your backend
+    FEED_EVERY = 6,                       -- ALL SERVERS refresh
+    UI_TICK = 0.5,                        -- one timer loop drives everything
+
     SIGHTING_TTL = 300,                   -- seconds a sighting stays live
 
-    -- NOTE: this game's field eggs are frequently in the 100M-900M/s range, so a
-    -- 1e9 floor hides almost everything. 1e8 keeps Mythic-and-up eggs visible;
-    -- raise it in SETTINGS once you know your server's numbers.
-    MIN_RATE = 1e8,                       -- hide/ignore eggs below this /s
-    MIN_RANK = 5,                         -- legendary and up (6 = mythic and up)
-    CARD_LIMIT = 8,
+    -- filters: 1e9 = 1B/s, MIN_RANK 5 = Legendary and up (6 = Mythic and up)
+    MIN_RATE = 1e9,                       -- 1B/s default, as requested
+    MIN_RANK = 0,                         -- 0 = show every rarity (button cycles up)
+
+    CARD_LIMIT = 12,                      -- max rows drawn in MY SERVER
+    FEED_LIMIT = 40,                      -- max rows fetched from the backend
+
     BROADCAST = true,                     -- upload sightings to your backend
-    AUTO_JOIN = false,                    -- JOIN buttons do nothing unless true
-    THEME_STARS = 26,
+    AUTO_JOIN = false,                    -- false = JOIN asks "SURE?" first
+    THEME_STARS = 16,                     -- backdrop dots (0 disables)
 }
 
--- Rarity tiers: display order, rank, and colour.
+--==============================================================================
+-- RARITY TABLE
+--==============================================================================
 local RARITIES = {
-    { name = "Common",    rank = 1,  color = Color3.fromRGB(220, 225, 235) },
-    { name = "Uncommon",  rank = 2,  color = Color3.fromRGB(105, 220, 120) },
-    { name = "Rare",      rank = 3,  color = Color3.fromRGB(65, 165, 255) },
-    { name = "Epic",      rank = 4,  color = Color3.fromRGB(255, 110, 200) },
-    { name = "Legendary", rank = 5,  color = Color3.fromRGB(255, 155, 45) },
-    { name = "Mythic",    rank = 6,  color = Color3.fromRGB(255, 75, 85) },
-    { name = "Cosmic",    rank = 7,  color = Color3.fromRGB(190, 85, 255) },
+    { name = "Common",    rank = 1,  color = Color3.fromRGB(214, 220, 232) },
+    { name = "Uncommon",  rank = 2,  color = Color3.fromRGB(104, 222, 138) },
+    { name = "Rare",      rank = 3,  color = Color3.fromRGB(80, 168, 255) },
+    { name = "Epic",      rank = 4,  color = Color3.fromRGB(196, 118, 255) },
+    { name = "Legendary", rank = 5,  color = Color3.fromRGB(255, 160, 60) },
+    { name = "Mythic",    rank = 6,  color = Color3.fromRGB(255, 86, 108) },
+    { name = "Cosmic",    rank = 7,  color = Color3.fromRGB(168, 96, 255) },
     { name = "Secret",    rank = 8,  color = Color3.fromRGB(255, 255, 255) },
-    { name = "Eternal",   rank = 9,  color = Color3.fromRGB(218, 202, 236) },
-    { name = "Divine",    rank = 10, color = Color3.fromRGB(255, 205, 55) },
+    { name = "Eternal",   rank = 9,  color = Color3.fromRGB(226, 210, 246) },
+    { name = "Divine",    rank = 10, color = Color3.fromRGB(255, 210, 70) },
 }
 local RARITY_BY_NAME, RARITY_BY_RANK = {}, {}
 for _, spec in ipairs(RARITIES) do
@@ -80,11 +94,11 @@ for _, spec in ipairs(RARITIES) do
     RARITY_BY_RANK[spec.rank] = spec
 end
 
--- Minimum-rarity cycle used by the filter button (index 1 = "Any").
+-- minimum-rarity cycle for the filter button (index 1 = Any)
 local FILTERS = { { name = "Any", rank = 0 } }
 for _, spec in ipairs(RARITIES) do FILTERS[#FILTERS + 1] = { name = spec.name, rank = spec.rank } end
 
--- Attribute names used when the game falls back to the generic scanner.
+-- attribute names used by the fallback scanner
 local SCHEMA = {
     UID = { "Uid", "UID", "EggUid", "Id", "ID" },
     CATEGORY = { "AssetCategory", "Category", "EggType", "Species" },
@@ -106,11 +120,18 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 assert(player, "Join the game before running M0x46 Finder.")
+local playerGui = player:WaitForChild("PlayerGui")
 
 local function log(...) warn("[M0x46]", ...) end
 
 local function validNumber(value)
     return type(value) == "number" and value == value and value >= 0 and value < math.huge
+end
+
+local function clamp(value, low, high)
+    if value < low then return low end
+    if value > high then return high end
+    return value
 end
 
 local function money(value)
@@ -131,9 +152,22 @@ local function compact(value)
     return string.format("%.2f", value)
 end
 
+local function moneyFilter(value)
+    if value >= 1e9 then return string.format("%gB", value / 1e9) end
+    if value >= 1e6 then return string.format("%gM", value / 1e6) end
+    if value <= 0 then return "off" end
+    return tostring(math.floor(value))
+end
+
+local function shortId(jobId)
+    if type(jobId) ~= "string" or jobId == "" then return "?" end
+    if #jobId <= 10 then return jobId end
+    return jobId:sub(1, 8)
+end
+
 local function requirePath(root, dotted)
     local node = root
-    for part in tostring(dotted):gmatch("[^.]+") do
+    for part in tostring(dotted):gmatch("[^%.]+") do
         node = node and node:FindFirstChild(part)
         if not node then return nil end
     end
@@ -143,6 +177,7 @@ local function requirePath(root, dotted)
 end
 
 local function readAttribute(object, names)
+    if not object then return nil end
     for _, name in ipairs(names) do
         local ok, value = pcall(function() return object:GetAttribute(name) end)
         if ok and value ~= nil then return value end
@@ -158,13 +193,12 @@ local MODULES = {
     assets = requirePath(ReplicatedStorage, "Data.Assets"),
     mutations = requirePath(ReplicatedStorage, "Shared.Modules.Mutations"),
     records = requirePath(ReplicatedStorage, "Shared.Util.EggRecords"),
-    slotIdentity = requirePath(ReplicatedStorage, "Shared.Util.AreaEggSlotIdentity"),
     cycle = requirePath(ReplicatedStorage, "Shared.Util.AreaEggCycle"),
     states = nil,
 }
 do
     local types = requirePath(ReplicatedStorage, "Shared.Types.AreaEggs")
-    if type(types) == "table" then MODULES.states = types.States end
+    if type(types) == "table" and type(types.States) == "table" then MODULES.states = types.States end
 end
 
 local CAPS = {
@@ -177,10 +211,13 @@ local CAPS = {
 
 local INCOME_UNITS = { [""] = 1, k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, q = 1e15, qi = 1e18 }
 
+-- Reads the billboard income the game itself displays on the egg model.
 local function displayedRate(model)
     if not model then return nil end
     local best
-    for _, object in ipairs(model:GetDescendants()) do
+    local ok, descendants = pcall(function() return model:GetDescendants() end)
+    if not ok or type(descendants) ~= "table" then return nil end
+    for _, object in ipairs(descendants) do
         if object:IsA("TextLabel") or object:IsA("TextButton") then
             local text = tostring(object.Text or ""):gsub("<[^>]+>", ""):gsub(",", "")
             local amount, suffix = text:match("%$?%s*(%d+%.?%d*)%s*(%a*)%s*/%s*[sS]")
@@ -213,7 +250,7 @@ local function mutationList(record, model)
         local clean = name:match("^%s*(.-)%s*$")
         if clean == "" or clean == "None" or clean == "Normal" then return end
         local key = clean:lower()
-        if clean:lower() == "gold" then clean, key = "Golden", "golden" end
+        if key == "gold" then clean, key = "Golden", "golden" end
         if seen[key] then return end
         seen[key] = true
         names[#names + 1] = clean
@@ -241,28 +278,27 @@ local function cycleInfo()
         elseif MODULES.cycle.NextResetTime then
             remaining = MODULES.cycle.NextResetTime(now) - now
         end
-        local resetAt = MODULES.cycle.NextResetTime and MODULES.cycle.NextResetTime(now) or nil
-        return { running = running, remaining = remaining, resetAt = resetAt }
+        return { running = running, remaining = remaining }
     end)
     return ok and info or nil
 end
 
--- One scan => enriched entry list -------------------------------------------------
+-- one record => one normalized entry -----------------------------------------
 local function enrich(uid, record, model)
     local category = record and (record.AssetCategory or record.Category) or readAttribute(model, SCHEMA.CATEGORY)
     local directory = type(MODULES.assets) == "table" and MODULES.assets.Directory or nil
     local asset = (directory and category and directory[category]) or {}
-    local rarity = asset.Rarity or {}
-    local rarityName = rarity.DisplayName or rarity._id or "Unknown"
+    local rarity = type(asset.Rarity) == "table" and asset.Rarity or {}
+    local rarityLabel = rarity.DisplayName or rarity._id or "Unknown"
     local rarityRank = tonumber(rarity.Rank) or 0
+
+    local scale = validNumber(record and record.AssetScale) and record.AssetScale
+        or readAttribute(model, SCHEMA.SCALE)
 
     local rate = displayedRate(model)
     local estimated = false
     if not rate then
-        -- Fall back to the asset's base income scaled the way the game does it.
         local base = asset.EarningRate
-        local scale = validNumber(record and record.AssetScale) and record.AssetScale
-            or readAttribute(model, SCHEMA.SCALE)
         local mutations = record and record.Mutations
         if validNumber(base) and validNumber(scale) and scale > 0 then
             local multiplier = 1
@@ -288,43 +324,36 @@ local function enrich(uid, record, model)
         if ok and validNumber(value) then weight = value end
     end
 
-    local scale = validNumber(record and record.AssetScale) and record.AssetScale
-        or readAttribute(model, SCHEMA.SCALE)
-
     return {
         uid = tostring(uid),
         name = tostring(asset.DisplayName or category or (model and model.Name) or uid),
         category = category and tostring(category) or nil,
-        rarity = tostring(rarityName),
+        rarity = tostring(rarityLabel),
         rank = rarityRank,
         rate = rate,
         estimated = estimated,
         scale = scale,
         weight = weight,
-        area = record and record.AreaId and tostring(record.AreaId) or readAttribute(model, SCHEMA.AREA),
-        nest = record and record.NestId,
+        area = (record and record.AreaId and tostring(record.AreaId)) or readAttribute(model, SCHEMA.AREA),
         mutations = mutationList(record, model),
-        icon = asset.Icon,
-        model = model,
+        jobId = game.JobId,
+        placeId = game.PlaceId,
         isLocal = true,
+        source = "scan",
     }
 end
 
 local SCAN_ROOTS = { "AreaEggSlotsClient", "EggSlots", "FieldEggs", "Eggs" }
 
 local function scanByAttributes()
-    local entries, seen = {}, {}
+    local entries = {}
     for _, rootName in ipairs(SCAN_ROOTS) do
         local container = workspace:FindFirstChild(rootName)
         if container then
             for _, child in ipairs(container:GetChildren()) do
                 if child:IsA("Model") then
-                    local uid = readAttribute(child, SCHEMA.UID) or child.Name
-                    uid = tostring(uid)
-                    if not seen[uid] then
-                        seen[uid] = true
-                        entries[#entries + 1] = enrich(uid, nil, child)
-                    end
+                    local uid = tostring(readAttribute(child, SCHEMA.UID) or child.Name)
+                    entries[#entries + 1] = enrich(uid, nil, child)
                 end
             end
         end
@@ -333,47 +362,53 @@ local function scanByAttributes()
     return entries
 end
 
-local function scanOnce()
-    local entries, seen = {}, {}
+-- Dedupe helper used by both scan paths: one row per uid, highest income wins.
+local function dedupe(entries)
+    local byKey, out = {}, {}
+    for _, entry in ipairs(entries) do
+        local key = tostring(entry.uid) .. "|" .. tostring(entry.jobId or "")
+        local existing = byKey[key]
+        if not existing then
+            byKey[key] = entry
+        elseif (entry.rate or -1) > (existing.rate or -1) then
+            byKey[key] = entry
+        end
+    end
+    for _, entry in pairs(byKey) do out[#out + 1] = entry end
+    table.sort(out, function(a, b)
+        local ar, br = a.rate or -1, b.rate or -1
+        if ar ~= br then return ar > br end
+        if (a.rank or 0) ~= (b.rank or 0) then return (a.rank or 0) > (b.rank or 0) end
+        return tostring(a.uid) < tostring(b.uid)
+    end)
+    return out
+end
 
+local function scanOnce()
+    local entries = {}
     if CAPS.moduleApi then
         local ok, snapshot = pcall(MODULES.eggState.ReadFieldEggs)
         if ok and type(snapshot) == "table" and type(snapshot.Records) == "table" then
             local states = MODULES.states
             for key, record in pairs(snapshot.Records) do
                 if type(record) == "table" then
-                    local usable = states == nil
-                        or record.State == nil
+                    local usable = states == nil or record.State == nil
                         or record.State == states.Slot
                         or record.State == states.Carried
                         or record.State == states.Dropped
                         or record.State == states.GuardCarried
                     local uid = record.Uid or key
                     if usable and uid ~= nil then
-                        uid = tostring(uid)
-                        if not seen[uid] then
-                            seen[uid] = true
-                            entries[#entries + 1] = enrich(uid, record, modelFor(uid))
-                        end
+                        entries[#entries + 1] = enrich(tostring(uid), record, modelFor(uid))
                     end
                 end
             end
         end
     end
-
     if #entries == 0 then
-        for _, entry in ipairs(scanByAttributes()) do
-            if not seen[entry.uid] then seen[entry.uid] = true; entries[#entries + 1] = entry end
-        end
+        for _, entry in ipairs(scanByAttributes()) do entries[#entries + 1] = entry end
     end
-
-    table.sort(entries, function(a, b)
-        local ar, br = a.rate or -1, b.rate or -1
-        if ar ~= br then return ar > br end
-        if a.rank ~= b.rank then return a.rank > b.rank end
-        return a.uid < b.uid
-    end)
-    return entries
+    return dedupe(entries)
 end
 
 --==============================================================================
@@ -389,19 +424,41 @@ local function httpRequest(options)
     return nil, "no HTTP function"
 end
 
--- Roblox runs each task.spawn on its own thread, so a single module-wide
--- "busy" flag lets the 0.25 s countdown loop starve the report/feed loops for
--- good (they see "busy" forever and never broadcast). The flag is therefore
--- per-coroutine: two calls on the same thread still cannot overlap.
+local function rawEndpoint()
+    local endpoint = tostring(CONFIG.ENDPOINT or "")
+    return endpoint:gsub("/+$", "")
+end
+
+-- Human-readable reason for every failure mode, so the UI can say what broke
+-- instead of showing "HTTP 0".
+local function describeError(err)
+    local text = tostring(err or "unknown error")
+    if text == "busy" then return "busy" end
+    if text == "HTTP unavailable" then return "this executor has no HTTP function" end
+    if text:find("401", 1, true) then return "room key rejected (X-Egg-Room)" end
+    if text:find("403", 1, true) then return "backend refused the request (403)" end
+    if text:find("404", 1, true) then return "endpoint not found (404) — check ENDPOINT path" end
+    if text:find("429", 1, true) then return "rate limited by your backend (429)" end
+    if text:find("HTTP 5", 1, true) then return "backend error (" .. text .. ")" end
+    if text:find("HTTP 0", 1, true) or text:find("request failed", 1, true) then
+        return "backend unreachable — the game cannot reach " .. rawEndpoint()
+    end
+    return text
+end
+
 local function api(method, pathAndQuery, body)
     if not CAPS.network then return nil, "HTTP unavailable" end
     local thread = coroutine.running() or MAIN_THREAD
     if BUSY[thread] then return nil, "busy" end
     BUSY[thread] = true
     local ok, response, transportError = pcall(httpRequest, {
-        Url = CONFIG.ENDPOINT .. pathAndQuery,
+        Url = rawEndpoint() .. pathAndQuery,
         Method = method,
-        Headers = { ["Content-Type"] = "application/json", ["X-M0x46-Room"] = CONFIG.ROOM_KEY },
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["X-Egg-Room"] = CONFIG.ROOM_KEY,     -- the header the backend checks
+            ["X-M0x46-Room"] = CONFIG.ROOM_KEY,   -- kept for older builds
+        },
         Body = body and HttpService:JSONEncode(body) or nil,
         Timeout = 8,
     })
@@ -409,12 +466,13 @@ local function api(method, pathAndQuery, body)
     if not ok then return nil, tostring(response) end
     if type(response) ~= "table" then return nil, tostring(transportError or "request failed") end
     local code = tonumber(response.StatusCode or response.Status) or 0
-    if code ~= 200 then return nil, "HTTP " .. code end
-    local decoded = select(2, pcall(HttpService.JSONDecode, HttpService, response.Body or ""))
-    if type(decoded) ~= "table" then return nil, "bad json" end
+    if code < 200 or code >= 300 then return nil, "HTTP " .. code end
+    local okDecode, decoded = pcall(HttpService.JSONDecode, HttpService, response.Body or "")
+    if not okDecode or type(decoded) ~= "table" then return nil, "bad json from backend" end
     return decoded
 end
 
+-- stable local reporter id (never printed, never key material)
 local reporterId
 do
     local ok, saved = pcall(function()
@@ -436,7 +494,7 @@ local function broadcast(entries)
     if not game.JobId or game.JobId == "" then return nil, "no server id" end
     local payload = {}
     for _, entry in ipairs(entries) do
-        if entry.rate and entry.rate > 0 then
+        if validNumber(entry.rate) and entry.rate > 0 then
             payload[#payload + 1] = {
                 uid = entry.uid,
                 name = entry.name,
@@ -452,6 +510,7 @@ local function broadcast(entries)
                 source = "field",
             }
         end
+        if #payload >= 25 then break end
     end
     if #payload == 0 then return nil, "nothing to report" end
     return api("POST", "/v1/report", {
@@ -463,77 +522,168 @@ local function broadcast(entries)
     })
 end
 
-local function fetchFeed(minRank, offset)
-    -- all=1 -> every egg from every server (full leaderboard), not just the best
-    -- egg per server. limit is the total card budget.
+-- The backend is asked WITHOUT income/rarity filters so the client keeps the
+-- full picture and can re-filter instantly when the user changes a filter.
+local function fetchFeed()
     return api("GET", string.format(
-        "/v1/eggs?placeId=%d&localJob=%s&limit=%d&offset=%d&minRate=%d&minRank=%d&all=1",
-        game.PlaceId, game.JobId or "", CONFIG.CARD_LIMIT, offset or 0,
-        math.floor(CONFIG.MIN_RATE), minRank or 0
+        "/v1/eggs?placeId=%d&localJob=%s&limit=%d&offset=0&minRate=0&minRank=0&all=1",
+        game.PlaceId, tostring(game.JobId or ""), CONFIG.FEED_LIMIT
     ))
 end
 
-local function claimAndJoin(entry)
-    if not CONFIG.AUTO_JOIN then return false, "AUTO_JOIN is off" end
-    if not entry.jobId or entry.jobId == game.JobId then return false, "already here" end
-    local claim, err = api("POST", "/v1/join", {
-        placeId = entry.placeId, jobId = entry.jobId, uid = entry.uid, reporterId = reporterId,
-    })
-    if not claim then return false, err or "claim failed" end
-    if claim.allowed ~= true then return false, "server refused (" .. tostring(claim.reason or "?") .. ")" end
-    local ok, error_ = pcall(function()
-        TeleportService:TeleportToPlaceInstance(entry.placeId, entry.jobId, player)
-    end)
-    if not ok then return false, tostring(error_) end
-    return true, "teleporting…"
-end
-
---==============================================================================
--- STATE
---==============================================================================
-local STATE = {
-    entries = {},
-    feed = {},
-    feedTotal = 0,
-    status = "starting…",
-    notice = nil,
-    noticeUntil = 0,
-    reportStatus = "connecting…",
-    filterIndex = 1,
-    minRank = CONFIG.MIN_RANK,
-    minRate = CONFIG.MIN_RATE,
-    tab = "local",
-    scanAge = 0,
+local INVALID_JOB = {
+    [""] = true, ["0"] = true, ["nil"] = true, ["null"] = true, ["undefined"] = true,
 }
 
--- Rarity label for a rank number (used by the filter message and the floor hint).
-local function rarityName(rank)
-    local spec = RARITY_BY_RANK[rank]
-    return spec and spec.name or "Any"
+local function validJobId(jobId)
+    if type(jobId) ~= "string" then return false end
+    if INVALID_JOB[jobId] then return false end
+    if #jobId < 8 or #jobId > 64 then return false end
+    if jobId == game.JobId then return false end
+    if not jobId:match("^[%w%-_]+$") then return false end
+    return true
 end
 
--- A short-lived message that outranks the per-scan status line, so clicking
--- JOIN / changing a setting is still readable one second later.
+local function normalizeFeedItem(item)
+    if type(item) ~= "table" then return nil end
+    local jobId = type(item.jobId) == "string" and item.jobId or nil
+    local rate = tonumber(item.rate)
+    local rank = tonumber(item.rank) or 0
+    local mutations = {}
+    if type(item.mutations) == "string" then
+        for token in item.mutations:gmatch("[^,;|+]+") do
+            local clean = token:match("^%s*(.-)%s*$")
+            if clean ~= "" then mutations[#mutations + 1] = clean end
+        end
+    elseif type(item.mutations) == "table" then
+        for _, value in ipairs(item.mutations) do mutations[#mutations + 1] = tostring(value) end
+    end
+    return {
+        uid = tostring(item.uid or (jobId or "?") .. ":" .. tostring(item.name or "?")),
+        name = tostring(item.name or "Unknown egg"),
+        rarity = tostring(item.rarity or "Unknown"),
+        rank = rank,
+        rate = validNumber(rate) and rate or nil,
+        scale = tonumber(item.scale),
+        weight = tonumber(item.weight),
+        area = item.area and tostring(item.area) or nil,
+        mutations = mutations,
+        estimated = item.estimated == true,
+        jobId = jobId,
+        placeId = tonumber(item.placeId) or game.PlaceId,
+        isLocal = item.isLocal == true or (jobId ~= nil and jobId == game.JobId),
+        seenAt = tonumber(item.seenAt),
+        source = "backend",
+    }
+end
+
+--==============================================================================
+-- STATE  (raw data is kept separate from filtering)
+--==============================================================================
+local STATE = {
+    tab = "local",
+    raw = {},            -- unfiltered field eggs from the last scan
+    rawAt = 0,
+    scanned = 0,         -- how many records the last scan produced
+    feed = {},           -- unfiltered backend eggs
+    feedMatched = 0,     -- backend eggs after filters (for messages)
+    feedTotal = 0,
+    feedAt = 0,
+    feedBusy = false,
+    feedError = nil,     -- nil = never fetched, else friendly reason
+    feedLoaded = false,
+    minRate = CONFIG.MIN_RATE,
+    minRank = CONFIG.MIN_RANK,
+    filterIndex = 1,
+    status = "starting…",
+    reportStatus = "offline",
+    notice = nil,
+    noticeUntil = 0,
+    dirty = true,
+}
+
+for index, spec in ipairs(FILTERS) do
+    if spec.rank == STATE.minRank then STATE.filterIndex = index end
+end
+
 local function notify(message, seconds)
     STATE.notice = tostring(message)
     STATE.noticeUntil = os.clock() + (seconds or 4)
 end
 
+local function raritySpec(entry)
+    local byName = RARITY_BY_NAME[tostring((entry and entry.rarity) or ""):lower()]
+    if byName then return byName end
+    local rank = tonumber(entry and entry.rank) or 0
+    if RARITY_BY_RANK[rank] then return RARITY_BY_RANK[rank] end
+    return { name = tostring((entry and entry.rarity) or "Unknown"), rank = rank, color = Color3.fromRGB(176, 162, 210) }
+end
+
+local function displayRank(entry)
+    local rank = tonumber(entry.rank) or 0
+    if rank > 0 then return rank end
+    return raritySpec(entry).rank
+end
+
+local function rarityName(rank)
+    local spec = RARITY_BY_RANK[rank]
+    return spec and spec.name or "Any"
+end
+
+-- The single filter used by MY SERVER, ALL SERVERS, the scan loop and REFRESH.
+-- rule: an egg with no measurable income cannot satisfy an income floor.
+local function passesFilter(entry)
+    local rate = tonumber(entry.rate)
+    if not rate or not validNumber(rate) or rate <= 0 then
+        return STATE.minRate <= 0
+    end
+    if rate < STATE.minRate then return false end
+    return displayRank(entry) >= STATE.minRank
+end
+
+local function sortByValue(a, b)
+    local ar, br = a.rate or -1, b.rate or -1
+    if ar ~= br then return ar > br end
+    if displayRank(a) ~= displayRank(b) then return displayRank(a) > displayRank(b) end
+    return tostring(a.name) < tostring(b.name)
+end
+
+-- visible rows for the current tab. Never mutates STATE.raw / STATE.feed.
+local function visibleList()
+    local source = STATE.tab == "local" and STATE.raw or STATE.feed
+    local matched = {}
+    for _, entry in ipairs(source) do
+        if passesFilter(entry) then matched[#matched + 1] = entry end
+    end
+    table.sort(matched, sortByValue)
+    local limit = CONFIG.CARD_LIMIT
+    if STATE.tab == "all" then limit = CONFIG.FEED_LIMIT end
+    local shown = {}
+    for index = 1, math.min(#matched, limit) do shown[index] = matched[index] end
+    return shown, #matched, #source
+end
+
+local function markDirty()
+    STATE.dirty = true
+end
+
 --==============================================================================
--- UI SHELL
+-- THEME + UI PRIMITIVES
 --==============================================================================
 local THEME = {
-    bg = Color3.fromRGB(10, 7, 22),
-    bgDeep = Color3.fromRGB(5, 3, 14),
-    glass = Color3.fromRGB(27, 20, 48),
-    glassHigh = Color3.fromRGB(46, 33, 80),
-    accent = Color3.fromRGB(147, 92, 255),
-    accentHot = Color3.fromRGB(213, 96, 255),
-    cyan = Color3.fromRGB(56, 205, 255),
-    text = Color3.fromRGB(245, 240, 255),
-    muted = Color3.fromRGB(176, 162, 210),
-    green = Color3.fromRGB(96, 235, 150),
-    red = Color3.fromRGB(238, 96, 106),
+    bg = Color3.fromRGB(9, 6, 18),
+    bgDeep = Color3.fromRGB(5, 3, 12),
+    glass = Color3.fromRGB(22, 16, 38),
+    glassHigh = Color3.fromRGB(34, 24, 58),
+    line = Color3.fromRGB(58, 42, 96),
+    accent = Color3.fromRGB(150, 92, 255),
+    accentHot = Color3.fromRGB(214, 96, 255),
+    cyan = Color3.fromRGB(86, 214, 255),
+    text = Color3.fromRGB(244, 240, 255),
+    muted = Color3.fromRGB(162, 150, 198),
+    green = Color3.fromRGB(96, 232, 156),
+    red = Color3.fromRGB(240, 104, 120),
+    amber = Color3.fromRGB(255, 202, 92),
 }
 
 local function make(class, props, parent)
@@ -543,16 +693,44 @@ local function make(class, props, parent)
     return object
 end
 
+local function corner(radius, parent)
+    return make("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
+end
+
+local function stroke(parent, color, thickness, transparency)
+    return make("UIStroke", {
+        Color = color or THEME.line, Thickness = thickness or 1,
+        Transparency = transparency or 0.3, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, parent)
+end
+
 local function label(parent, text, position, size, color, textSize)
     return make("TextLabel", {
         Text = text, Position = position, Size = size, BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold, TextSize = textSize or 13,
+        Font = Enum.Font.GothamBold, TextSize = textSize or 12,
         TextColor3 = color or THEME.text, TextXAlignment = Enum.TextXAlignment.Left,
         TextTruncate = Enum.TextTruncate.AtEnd,
     }, parent)
 end
 
-local oldGui = player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("M0x46Finder")
+local function button(parent, props, accent)
+    local object = make("TextButton", props, parent)
+    corner(props.CornerRadius or 8, object)
+    object.BackgroundColor3 = accent and THEME.accent or THEME.glass
+    object.BackgroundTransparency = accent and 0.05 or 0.12
+    object.TextColor3 = THEME.text
+    object.Font = Enum.Font.GothamBold
+    object.TextSize = props.TextSize or 12
+    object.BorderSizePixel = 0
+    object.AutoButtonColor = false
+    stroke(object, accent and THEME.accentHot or THEME.line, 1, accent and 0.35 or 0.45)
+    return object
+end
+
+--==============================================================================
+-- ROOT GUI
+--==============================================================================
+local oldGui = playerGui:FindFirstChild("M0x46Finder")
 if oldGui then oldGui:Destroy() end
 
 local gui = make("ScreenGui", {
@@ -561,30 +739,59 @@ local gui = make("ScreenGui", {
     IgnoreGuiInset = true,
     DisplayOrder = 1200,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-})
-gui.Parent = player:WaitForChild("PlayerGui")
+}, playerGui)
 
-local panel = make("Frame", {
-    Name = "Panel",
-    Size = UDim2.fromOffset(404, 560),
-    Position = UDim2.new(0.5, -202, 0.5, -280),
-    BackgroundColor3 = THEME.bg,
-    BackgroundTransparency = 0.05,
-    BorderSizePixel = 0,
-    Active = true,
-    Visible = false,
-}, gui)
-make("UICorner", { CornerRadius = UDim.new(0, 12) }, panel)
-local panelStroke = make("UIStroke", {
-    Color = THEME.accent, Thickness = 1.5, Transparency = 0.22,
-    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-}, panel)
-make("UIGradient", { Rotation = 55, Color = ColorSequence.new(THEME.accent, THEME.cyan) }, panelStroke)
+-- viewport (guarded: cameras can be missing in test environments)
+local function viewport()
+    local ok, camera = pcall(function() return workspace.CurrentCamera end)
+    local size = ok and camera and camera.ViewportSize
+    if type(size) == "table" and (size.X or 0) > 0 and (size.Y or 0) > 0 then
+        return size.X, size.Y
+    end
+    return 1280, 720
+end
+
+local MOBILE_TOPBAR, SCREEN_MARGIN = 44, 8
+
+--==============================================================================
+-- LAUNCHER  (minimised state)
+--==============================================================================
+local launcher = button(gui, {
+    Name = "Launcher", Text = "M0x46",
+    Position = UDim2.new(0, 16, 0.5, -20), Size = UDim2.fromOffset(84, 40),
+    TextSize = 13, CornerRadius = 20, ZIndex = 40,
+}, true)
+launcher.Font = Enum.Font.GothamBlack
 make("UIGradient", {
-    Rotation = 95, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(150, 138, 190)),
-}, panel)
+    Rotation = 30,
+    Color = ColorSequence.new(THEME.accent, THEME.accentHot),
+}, launcher)
 
--- starfield backdrop ---------------------------------------------------------
+local launcherDot = make("Frame", {
+    Name = "Live", Size = UDim2.fromOffset(7, 7), Position = UDim2.new(1, -14, 0, 9),
+    BackgroundColor3 = THEME.green, BorderSizePixel = 0, ZIndex = 41,
+}, launcher)
+corner(4, launcherDot)
+
+--==============================================================================
+-- PANEL
+--==============================================================================
+local panel = make("Frame", {
+    Name = "Panel", Size = UDim2.fromOffset(404, 560),
+    Position = UDim2.new(0, 16, 0, 60),
+    BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.04, BorderSizePixel = 0,
+    Active = true, Visible = false, ClipsDescendants = true, ZIndex = 10,
+}, gui)
+corner(14, panel)
+local panelStroke = stroke(panel, THEME.accent, 1.4, 0.25)
+make("UIGradient", { Rotation = 50, Color = ColorSequence.new(THEME.accent, THEME.cyan) }, panelStroke)
+make("UIGradient", {
+    Rotation = 96,
+    Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(148, 132, 196)),
+}, panel)
+local panelScale = make("UIScale", { Scale = 1 }, panel)
+
+-- backdrop dots ---------------------------------------------------------------
 local starfield = make("Frame", {
     Name = "Starfield", BackgroundTransparency = 1, BorderSizePixel = 0,
     Size = UDim2.fromScale(1, 1), Active = false, ZIndex = 1,
@@ -592,450 +799,817 @@ local starfield = make("Frame", {
 local starTweens = {}
 do
     local random = Random.new(4617)
-    for i = 1, CONFIG.THEME_STARS do
+    for index = 1, CONFIG.THEME_STARS do
         local dot = make("Frame", {
-            Name = "Star" .. i, BorderSizePixel = 0, Active = false, ZIndex = 1,
-            Position = UDim2.fromScale(random:NextNumber(0.03, 0.97), random:NextNumber(0.08, 0.96)),
-            BackgroundColor3 = (i % 7 == 0) and THEME.cyan or (i % 3 == 0) and THEME.accentHot or Color3.fromRGB(232, 226, 255),
+            Name = "Star" .. index, BorderSizePixel = 0, Active = false, ZIndex = 1,
+            Position = UDim2.fromScale(random:NextNumber(0.04, 0.96), random:NextNumber(0.06, 0.97)),
+            BackgroundColor3 = (index % 5 == 0) and THEME.cyan or (index % 3 == 0) and THEME.accentHot
+                or Color3.fromRGB(226, 220, 255),
         }, starfield)
-        local size = random:NextInteger(2, 3)
-        dot.Size = UDim2.fromOffset(size, size)
-        dot.BackgroundTransparency = random:NextNumber(0.3, 0.62)
-        make("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
-        local tween = TweenService:Create(dot, TweenInfo.new(random:NextNumber(1.4, 3.4), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
-            BackgroundTransparency = 0.88,
-            Size = UDim2.fromOffset(size + 1, size + 1),
+        local dotSize = random:NextInteger(2, 3)
+        dot.Size = UDim2.fromOffset(dotSize, dotSize)
+        dot.BackgroundTransparency = random:NextNumber(0.35, 0.7)
+        corner(4, dot)
+        local tween = TweenService:Create(dot, TweenInfo.new(
+            random:NextNumber(1.8, 3.6), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
+        ), {
+            BackgroundTransparency = 0.9,
+            Size = UDim2.fromOffset(dotSize + 1, dotSize + 1),
         })
         tween:Play()
         starTweens[#starTweens + 1] = tween
     end
 end
 
--- header ---------------------------------------------------------------------
+-- header ----------------------------------------------------------------------
+local HEADER_H = 50
 local header = make("Frame", {
-    Name = "Header", Position = UDim2.fromOffset(1, 1), Size = UDim2.new(1, -2, 0, 46),
-    BackgroundColor3 = THEME.bgDeep, BackgroundTransparency = 0.15, BorderSizePixel = 0, ZIndex = 4,
+    Name = "Header", Position = UDim2.fromOffset(1, 1), Size = UDim2.new(1, -2, 0, HEADER_H),
+    BackgroundColor3 = THEME.bgDeep, BackgroundTransparency = 0.1, BorderSizePixel = 0, ZIndex = 12,
 }, panel)
-make("UICorner", { CornerRadius = UDim.new(0, 12) }, header)
+corner(14, header)
 
-local heading = label(panel, "M0x46 FINDER", UDim2.fromOffset(12, 6), UDim2.new(1, -110, 0, 24), THEME.text, 18)
-heading.Font = Enum.Font.GothamBlack
-heading.ZIndex = 5
-local headingStroke = make("UIStroke", { Color = THEME.accent, Thickness = 1.2, Transparency = 0.4 }, heading)
+local title = label(panel, "M0x46 FINDER", UDim2.fromOffset(14, 7), UDim2.new(1, -110, 0, 22), THEME.text, 17)
+title.Font = Enum.Font.GothamBlack
+title.ZIndex = 13
 make("UIGradient", {
     Rotation = 0,
-    Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(196, 164, 255)),
-}, heading)
+    Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(198, 164, 255)),
+}, title)
 
-local statusText = label(panel, "starting…", UDim2.fromOffset(12, 27), UDim2.new(1, -110, 0, 14), THEME.cyan, 11)
-statusText.ZIndex = 5
+local statusText = label(panel, "starting…", UDim2.fromOffset(14, 29), UDim2.new(1, -110, 0, 15), THEME.cyan, 10)
+statusText.ZIndex = 13
+
+local minimizeButton = button(panel, {
+    Name = "Minimize", Text = "—", Position = UDim2.new(1, -76, 0, 12),
+    Size = UDim2.fromOffset(28, 26), TextSize = 14, CornerRadius = 8, ZIndex = 14,
+}, false)
+local closeButton = button(panel, {
+    Name = "Close", Text = "✕", Position = UDim2.new(1, -44, 0, 12),
+    Size = UDim2.fromOffset(28, 26), TextSize = 12, CornerRadius = 8, ZIndex = 14,
+}, false)
+closeButton.TextColor3 = THEME.red
 
 local hairline = make("Frame", {
     Name = "Hairline", BorderSizePixel = 0, Active = false, BackgroundColor3 = THEME.accent,
-    Position = UDim2.new(0, 12, 0, 46), Size = UDim2.new(1, -24, 0, 1), ZIndex = 5,
+    Position = UDim2.new(0, 12, 0, HEADER_H + 1), Size = UDim2.new(1, -24, 0, 1), ZIndex = 13,
 }, panel)
 make("UIGradient", { Rotation = 0, Transparency = NumberSequence.new({
-    NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.18, 0.25),
-    NumberSequenceKeypoint.new(0.82, 0.25), NumberSequenceKeypoint.new(1, 1),
+    NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.15, 0.2),
+    NumberSequenceKeypoint.new(0.85, 0.2), NumberSequenceKeypoint.new(1, 1),
 })}, hairline)
 
--- tabs -----------------------------------------------------------------------
+-- tabs ------------------------------------------------------------------------
+local TABS_Y = HEADER_H + 8
 local tabBar = make("Frame", {
-    Name = "Tabs", Position = UDim2.fromOffset(10, 52), Size = UDim2.new(1, -20, 0, 30),
-    BackgroundTransparency = 1, ZIndex = 4,
+    Name = "Tabs", Position = UDim2.fromOffset(10, TABS_Y), Size = UDim2.new(1, -20, 0, 32),
+    BackgroundTransparency = 1, ZIndex = 12,
 }, panel)
-make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, tabBar)
+make("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+    SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center,
+}, tabBar)
 
-local function styleButton(button, accent)
-    make("UICorner", { CornerRadius = UDim.new(0, 8) }, button)
-    button.BackgroundColor3 = accent and THEME.accent or THEME.glass
-    button.BackgroundTransparency = 0.04
-    button.TextColor3 = THEME.text
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 12
-    button.BorderSizePixel = 0
-    button.AutoButtonColor = false
-    button.ZIndex = 5
-    make("UIStroke", {
-        Color = THEME.accent, Thickness = 1, Transparency = 0.3,
-        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-    }, button)
-    return button
-end
+local localTab = button(tabBar, {
+    Name = "TabLocal", Text = "MY SERVER", Size = UDim2.new(0.5, -3, 0, 30),
+    LayoutOrder = 1, TextSize = 11, CornerRadius = 8,
+}, true)
+local feedTab = button(tabBar, {
+    Name = "TabAll", Text = "ALL SERVERS", Size = UDim2.new(0.5, -3, 0, 30),
+    LayoutOrder = 2, TextSize = 11, CornerRadius = 8,
+}, false)
 
--- Named so the runtime harness / any automation can find them by name.
-local localTab = styleButton(make("TextButton", { Name = "TabLocal", Text = "MY SERVER", Size = UDim2.fromOffset(120, 28), LayoutOrder = 1 }, tabBar), true)
-local feedTab = styleButton(make("TextButton", { Name = "TabAll", Text = "ALL SERVERS", Size = UDim2.fromOffset(130, 28), LayoutOrder = 2 }, tabBar), false)
+-- filter row ------------------------------------------------------------------
+local FILTER_Y = TABS_Y + 38
+local filterButton = button(panel, {
+    Name = "RarityFilter", Text = "RARITY: ANY",
+    Position = UDim2.fromOffset(10, FILTER_Y), Size = UDim2.new(0.52, -12, 0, 30),
+    TextSize = 11, CornerRadius = 8,
+}, false)
 
--- controls row ---------------------------------------------------------------
-local filterButton = styleButton(make("TextButton", {
-    Name = "RarityFilter", Text = "MIN RARITY: ANY",
-    Position = UDim2.fromOffset(10, 88), Size = UDim2.new(0.52, -12, 0, 30),
-}, panel), false)
-
-local refreshButton = styleButton(make("TextButton", {
+local refreshButton = button(panel, {
     Name = "Refresh", Text = "REFRESH",
-    Position = UDim2.new(0.52, 2, 0, 88), Size = UDim2.new(0.28, -6, 0, 30),
-}, panel), false)
+    Position = UDim2.new(0.52, 0, 0, FILTER_Y), Size = UDim2.new(0.24, -4, 0, 30),
+    TextSize = 11, CornerRadius = 8,
+}, false)
 
-local resetLabel = label(panel, "RESET --:--", UDim2.new(0.80, 2, 0, 95), UDim2.new(0.20, -12, 0, 18), THEME.muted, 11)
-
--- cards ----------------------------------------------------------------------
-local list = make("ScrollingFrame", {
-    Name = "List", Position = UDim2.fromOffset(10, 124), Size = UDim2.new(1, -20, 1, -196),
-    BackgroundColor3 = THEME.panel or THEME.glass, BackgroundTransparency = 1, BorderSizePixel = 0,
-    CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    ScrollBarThickness = 6, ScrollBarImageColor3 = THEME.accent, ScrollBarImageTransparency = 0.15,
-    ZIndex = 4,
+local resetLabel = make("TextLabel", {
+    Name = "Reset",
+    Text = "--:--", Position = UDim2.new(0.76, 4, 0, FILTER_Y), Size = UDim2.new(0.24, -14, 0, 30),
+    BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 11,
+    TextColor3 = THEME.muted, TextXAlignment = Enum.TextXAlignment.Right,
+    TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5,
 }, panel)
-make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, list)
+
+-- list ------------------------------------------------------------------------
+local LIST_Y = FILTER_Y + 36
+local LIST_FOOTER = 76   -- footer (30) + hint (18) + margins
+local list = make("ScrollingFrame", {
+    Name = "List", Position = UDim2.fromOffset(10, LIST_Y),
+    Size = UDim2.new(1, -20, 1, -(LIST_Y + LIST_FOOTER)),
+    BackgroundTransparency = 1, BorderSizePixel = 0,
+    CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollBarThickness = 4, ScrollBarImageColor3 = THEME.accent, ScrollBarImageTransparency = 0.25,
+    ScrollingDirection = Enum.ScrollingDirection.Y, ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
+    ZIndex = 11,
+}, panel)
+make("UIListLayout", {
+    Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+    HorizontalAlignment = Enum.HorizontalAlignment.Left,
+}, list)
 make("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2) }, list)
 
--- footer ---------------------------------------------------------------------
-local broadcastButton = styleButton(make("TextButton", {
+-- footer ----------------------------------------------------------------------
+local footerY = -66
+local broadcastButton = button(panel, {
     Name = "Broadcast", Text = "BROADCAST: ON",
-    Position = UDim2.new(0, 10, 1, -64), Size = UDim2.new(0.48, -13, 0, 30),
-}, panel), false)
-
-local settingsButton = styleButton(make("TextButton", {
+    Position = UDim2.new(0, 10, 1, footerY), Size = UDim2.new(0.5, -13, 0, 30),
+    TextSize = 11, CornerRadius = 8,
+}, false)
+local settingsButton = button(panel, {
     Name = "Settings", Text = "SETTINGS",
-    Position = UDim2.new(0.52, 3, 1, -64), Size = UDim2.new(0.48, -13, 0, 30),
-}, panel), false)
+    Position = UDim2.new(0.5, 3, 1, footerY), Size = UDim2.new(0.5, -13, 0, 30),
+    TextSize = 11, CornerRadius = 8,
+}, false)
 
-local noticeLabel = label(panel, "SIGHTINGS SHARED WITH YOUR OWN SERVER", UDim2.new(0, 12, 1, -30), UDim2.new(1, -24, 0, 18), THEME.muted, 10)
-noticeLabel.TextXAlignment = Enum.TextXAlignment.Center
-noticeLabel.TextScaled = true
+local footerHint = make("TextLabel", {
+    Name = "FooterHint", Text = "SIGHTINGS SHARED WITH YOUR OWN SERVER",
+    Position = UDim2.new(0, 12, 1, -30), Size = UDim2.new(1, -24, 0, 16),
+    BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10,
+    TextColor3 = THEME.muted, TextXAlignment = Enum.TextXAlignment.Center,
+    TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5,
+}, panel)
 
 --==============================================================================
--- SETTINGS OVERLAY
+-- SETTINGS OVERLAY (scrollable so it never overflows on a phone)
 --==============================================================================
 local overlay = make("Frame", {
     Name = "SettingsOverlay", Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 1),
-    BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.02, BorderSizePixel = 0,
+    BackgroundColor3 = THEME.bgDeep, BackgroundTransparency = 0.03, BorderSizePixel = 0,
     Visible = false, ZIndex = 30,
 }, panel)
-make("UICorner", { CornerRadius = UDim.new(0, 12) }, overlay)
-make("UIStroke", { Color = THEME.accent, Thickness = 1.4, Transparency = 0.3 }, overlay)
+corner(14, overlay)
+stroke(overlay, THEME.accent, 1.2, 0.35)
 
-local overlayTitle = label(overlay, "SETTINGS", UDim2.fromOffset(16, 14), UDim2.new(1, -80, 0, 30), THEME.text, 18)
+local overlayTitle = label(overlay, "SETTINGS", UDim2.fromOffset(16, 12), UDim2.new(1, -80, 0, 24), THEME.text, 16)
+overlayTitle.Font = Enum.Font.GothamBlack
 overlayTitle.ZIndex = 31
 
-local overlayClose = styleButton(make("TextButton", {
-    Text = "X", Position = UDim2.new(1, -52, 0, 14), Size = UDim2.fromOffset(34, 30), ZIndex = 31,
-}, overlay), false)
+local overlayClose = button(overlay, {
+    Name = "SettingsClose", Text = "✕", Position = UDim2.new(1, -46, 0, 12),
+    Size = UDim2.fromOffset(30, 26), TextSize = 12, CornerRadius = 8, ZIndex = 31,
+}, false)
 overlayClose.TextColor3 = THEME.red
 
-local function makeToggle(text, position)
-    local button = styleButton(make("TextButton", {
-        Text = text, Position = position, Size = UDim2.new(1, -32, 0, 44), ZIndex = 31,
-    }, overlay), false)
-    return button
+local overlayBody = make("ScrollingFrame", {
+    Name = "SettingsBody", Position = UDim2.fromOffset(10, 44), Size = UDim2.new(1, -20, 1, -52),
+    BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3,
+    ScrollBarImageColor3 = THEME.accent, ScrollingDirection = Enum.ScrollingDirection.Y, ZIndex = 31,
+}, overlay)
+make("UIListLayout", {
+    Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder,
+    HorizontalAlignment = Enum.HorizontalAlignment.Center,
+}, overlayBody)
+make("UIPadding", { PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 10) }, overlayBody)
+
+local function overRow(height, order)
+    return make("Frame", {
+        Size = UDim2.new(1, -12, 0, height), BackgroundTransparency = 1,
+        LayoutOrder = order, ZIndex = 31,
+    }, overlayBody)
 end
 
-local broadcastToggle = makeToggle("BROADCAST: ON", UDim2.fromOffset(16, 60))
-local autoJoinToggle = makeToggle("AUTO JOIN: OFF", UDim2.fromOffset(16, 112))
-
+-- minimum income: text box + quick presets
+local rateRow = overRow(76, 1)
+local rateTitle = label(rateRow, "MINIMUM INCOME", UDim2.fromOffset(2, 0), UDim2.new(1, -4, 0, 16), THEME.muted, 10)
+rateTitle.Font = Enum.Font.GothamBold
 local rateBox = make("TextBox", {
-    Name = "MinRate", Text = string.format("%gB", CONFIG.MIN_RATE / 1e9),
-    PlaceholderText = "min income, e.g. 1.5B",
-    Position = UDim2.fromOffset(16, 168), Size = UDim2.new(1, -32, 0, 40),
+    Name = "MinRate", Text = moneyFilter(STATE.minRate), PlaceholderText = "1B",
+    Position = UDim2.fromOffset(0, 18), Size = UDim2.new(0.4, -4, 0, 30),
     BackgroundColor3 = THEME.glassHigh, TextColor3 = THEME.text, TextSize = 13,
-    Font = Enum.Font.GothamBold, ClearTextOnFocus = false, BorderSizePixel = 0, ZIndex = 31,
-}, overlay)
-make("UICorner", { CornerRadius = UDim.new(0, 8) }, rateBox)
-make("UIStroke", { Color = THEME.accent, Thickness = 1, Transparency = 0.45, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, rateBox)
+    Font = Enum.Font.GothamBold, ClearTextOnFocus = false, BorderSizePixel = 0, ZIndex = 32,
+    TextXAlignment = Enum.TextXAlignment.Center,
+}, rateRow)
+corner(8, rateBox)
+stroke(rateBox, THEME.accent, 1, 0.4)
 
-local rateHint = label(overlay, "Minimum income per second (0 – 50B, 0 = all)", UDim2.fromOffset(18, 214), UDim2.new(1, -36, 0, 16), THEME.muted, 11)
-rateHint.ZIndex = 31
+local PRESETS = { { label = "OFF", value = 0 }, { label = "250M", value = 2.5e8 }, { label = "1B", value = 1e9 }, { label = "5B", value = 5e9 } }
+local presetButtons = {}
+for index, preset in ipairs(PRESETS) do
+    local presetButton = button(rateRow, {
+        Text = preset.label, Position = UDim2.new(0.4 + (index - 1) * 0.15, 2, 0, 18),
+        Size = UDim2.new(0.15, -4, 0, 30), TextSize = 10, CornerRadius = 7, ZIndex = 32,
+    }, false)
+    presetButtons[#presetButtons + 1] = { button = presetButton, value = preset.value }
+end
+local rateHint = label(rateRow, "B/s — 0 or OFF shows every egg", UDim2.fromOffset(2, 54), UDim2.new(1, -4, 0, 14), THEME.muted, 9)
+rateHint.Font = Enum.Font.Gotham
 
-local overlayInfo = label(overlay, "", UDim2.fromOffset(18, 250), UDim2.new(1, -36, 0, 90), THEME.muted, 11)
-overlayInfo.TextWrapped = true
-overlayInfo.TextYAlignment = Enum.TextYAlignment.Top
-overlayInfo.ZIndex = 31
-overlayInfo.Text = "endpoint: " .. CONFIG.ENDPOINT .. "\nreporter: " .. tostring(reporterId):sub(1, 18) ..
-    "\ncards/feed limit: " .. CONFIG.CARD_LIMIT .. "\nsource: " .. (CAPS.moduleApi and "game module" or "attribute scan")
+-- toggles
+local broadcastToggle = button(overlayBody, {
+    Name = "BroadcastToggle", Text = "BROADCAST: ON", Size = UDim2.new(1, -12, 0, 38),
+    LayoutOrder = 2, TextSize = 11, CornerRadius = 9, ZIndex = 31,
+}, false)
+local autoJoinToggle = button(overlayBody, {
+    Name = "AutoJoinToggle", Text = "AUTO JOIN: OFF", Size = UDim2.new(1, -12, 0, 38),
+    LayoutOrder = 3, TextSize = 11, CornerRadius = 9, ZIndex = 31,
+}, false)
+local autoJoinHint = make("TextLabel", {
+    Text = "OFF = JOIN asks SURE? first. ON = JOIN teleports immediately.",
+    Size = UDim2.new(1, -12, 0, 26), BackgroundTransparency = 1, LayoutOrder = 4,
+    Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = THEME.muted,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31,
+}, overlayBody)
+
+local infoRow = make("TextLabel", {
+    Name = "Diagnostics", Text = "", Size = UDim2.new(1, -12, 0, 108),
+    BackgroundTransparency = 1, LayoutOrder = 5, Font = Enum.Font.Gotham, TextSize = 10,
+    TextColor3 = THEME.muted, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 31,
+}, overlayBody)
+
+local function paintOverlayInfo()
+    infoRow.Text = table.concat({
+        "backend : " .. rawEndpoint(),
+        "status   : " .. tostring(STATE.feedError and describeError(STATE.feedError) or (STATE.feedLoaded and "reachable" or "not contacted yet")),
+        "game src : " .. (CAPS.moduleApi and "Client.EggState module" or "attribute scan"),
+        "scanned  : " .. tostring(STATE.scanned) .. " egg(s) in this server",
+        "feed     : " .. tostring(#STATE.feed) .. " egg(s) cached, " .. tostring(STATE.feedTotal) .. " on backend",
+        "session  : " .. tostring(reporterId):sub(1, 8) .. "… (anonymous)",
+        "row cap  : " .. CONFIG.CARD_LIMIT .. " local / " .. CONFIG.FEED_LIMIT .. " feed",
+    }, "\n")
+end
 
 --==============================================================================
--- LAUNCHER + DRAG
+-- RESPONSIVE LAYOUT + DRAG
 --==============================================================================
-local launcher = make("TextButton", {
-    Name = "Launcher", Text = "M0x46",
-    Size = UDim2.fromOffset(62, 62), Position = UDim2.new(0, 26, 0.5, -31),
-    BackgroundColor3 = THEME.accent, TextColor3 = Color3.new(1, 1, 1),
-    Font = Enum.Font.GothamBlack, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
-    ZIndex = 20,
-}, gui)
-make("UICorner", { CornerRadius = UDim.new(1, 0) }, launcher)
-make("UIStroke", { Color = THEME.accentHot, Thickness = 2, Transparency = 0.15, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, launcher)
-make("UIGradient", { Rotation = 35, Color = ColorSequence.new(THEME.accent, THEME.cyan) }, launcher)
+local panelX, panelY = 16, 60
+local panelW, panelH = 404, 560
 
+local function clampPanel()
+    local vw, vh = viewport()
+    panelW = clamp(panelW, 280, math.min(440, vw - 16))
+    panelH = clamp(panelH, 300, math.min(640, vh - MOBILE_TOPBAR - 16))
+    panelX = clamp(panelX, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - panelW - SCREEN_MARGIN))
+    panelY = clamp(panelY, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - panelH - SCREEN_MARGIN))
+    panel.Size = UDim2.fromOffset(panelW, panelH)
+    panel.Position = UDim2.fromOffset(panelX, panelY)
+end
+
+local function clampLauncher()
+    local vw, vh = viewport()
+    local position = launcher.Position
+    local x = clamp(position.X.Offset, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - 84 - SCREEN_MARGIN))
+    local y = clamp(position.Y.Offset, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - 40 - SCREEN_MARGIN))
+    launcher.Position = UDim2.fromOffset(x, y)
+end
+
+-- list height drives card density: fewer rows on a phone, richer rows on a PC
+local function cardHeight()
+    clampPanel()
+    local listHeight = panelH - (LIST_Y + LIST_FOOTER)
+    if listHeight <= 0 then return 96 end
+    local perCard = listHeight / 3.2
+    return math.floor(clamp(perCard - 6, 58, 104))
+end
+
+-- 4 rows on tall cards, 3 rows mid, 2 rows compact
+local function cardRows()
+    local height = cardHeight()
+    if height >= 92 then return 4 end
+    if height >= 74 then return 3 end
+    return 2
+end
+
+local function applyLayout()
+    clampPanel()
+    clampLauncher()
+    markDirty()
+end
+
+-- drag (mouse + touch), clamped to the screen so nothing can leave the viewport
 do
-    local dragging, startMouse, startPosition = false, nil, nil
+    local dragging, dragTarget, startMouse, startOffset = false, nil, nil, nil
+
     local function beginDrag(handle, target)
         handle.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
                 dragging = true
+                dragTarget = target
                 startMouse = input.Position
-                startPosition = target.Position
+                startOffset = target.Position
             end
         end)
     end
+
     beginDrag(header, panel)
     beginDrag(launcher, launcher)
+
     UserInputService.InputChanged:Connect(function(input)
-        if not dragging then return end
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = input.Position - startMouse
-            local target = panel.Visible and panel or launcher
-            target.Position = UDim2.new(
-                startPosition.X.Scale, startPosition.X.Offset + delta.X,
-                startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
-            )
-        end
+        if not dragging or not dragTarget then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local delta = input.Position - startMouse
+        local vw, vh = viewport()
+        local width = dragTarget == panel and panelW or 84
+        local height = dragTarget == panel and panelH or 40
+        local x = clamp(startOffset.X.Offset + delta.X, SCREEN_MARGIN, math.max(SCREEN_MARGIN, vw - width - SCREEN_MARGIN))
+        local y = clamp(startOffset.Y.Offset + delta.Y, MOBILE_TOPBAR, math.max(MOBILE_TOPBAR, vh - height - SCREEN_MARGIN))
+        dragTarget.Position = UDim2.fromOffset(x, y)
     end)
+
     UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if not dragging then return end
+        dragging = false
+        if dragTarget == panel then
+            local position = panel.Position
+            panelX, panelY = position.X.Offset, position.Y.Offset
         end
+        dragTarget = nil
+    end)
+end
+
+if type(workspace.CurrentCamera) == "table" or type(workspace.CurrentCamera) == "userdata" then
+    pcall(function()
+        workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            applyLayout()
+            render()
+        end)
     end)
 end
 
 --==============================================================================
--- PROP ANIMATION (mutation / rarity gradients)
+-- GRADIENT ANIMATION  (engine-side tween: no per-frame Lua cost)
 --==============================================================================
 local MUTATION_PALETTE = {
-    golden = { Color3.fromRGB(206, 164, 0), Color3.fromRGB(255, 191, 0), Color3.fromRGB(255, 230, 120), Color3.fromRGB(255, 191, 0) },
-    silver = { Color3.fromRGB(120, 120, 120), Color3.fromRGB(200, 200, 200), Color3.fromRGB(255, 255, 255), Color3.fromRGB(200, 200, 200) },
-    rainbow = { Color3.fromRGB(255, 0, 0), Color3.fromRGB(255, 200, 0), Color3.fromRGB(0, 255, 60), Color3.fromRGB(0, 190, 255), Color3.fromRGB(180, 0, 255) },
+    golden = { Color3.fromRGB(198, 156, 0), Color3.fromRGB(255, 196, 20), Color3.fromRGB(255, 236, 140) },
+    silver = { Color3.fromRGB(126, 126, 132), Color3.fromRGB(206, 206, 214), Color3.fromRGB(255, 255, 255) },
+    rainbow = { Color3.fromRGB(255, 70, 90), Color3.fromRGB(255, 196, 60), Color3.fromRGB(86, 232, 140), Color3.fromRGB(76, 190, 255), Color3.fromRGB(186, 96, 255) },
+    frozen = { Color3.fromRGB(150, 210, 255), Color3.fromRGB(226, 244, 255), Color3.fromRGB(120, 180, 240) },
+    shadow = { Color3.fromRGB(96, 60, 160), Color3.fromRGB(40, 24, 70), Color3.fromRGB(150, 100, 220) },
 }
 
 local liveGradients = {}
 
-local function gradientSequence(palette, now)
-    local phase = (now / 4) % 1
+local function colorSequence(palette)
     local points = {}
-    for i = 0, 12 do
-        local sample = ((i / 12 - phase) % 1) * #palette
-        local index = math.floor(sample)
-        points[#points + 1] = ColorSequenceKeypoint.new(
-            i / 12,
-            palette[index + 1]:Lerp(palette[(index + 1) % #palette + 1], sample - index)
-        )
+    local count = #palette
+    for index = 0, count do
+        points[#points + 1] = ColorSequenceKeypoint.new(index / count, palette[(index % count) + 1])
     end
     return ColorSequence.new(points)
 end
 
+-- Adds a slowly scrolling gradient. Offset is tweened by the engine, so an
+-- animated rainbow costs zero Lua cycles (this used to be a 0.25 s loop).
 local function paintMutation(object, mutationName)
     local palette = MUTATION_PALETTE[tostring(mutationName):lower()]
     if not palette then return end
     if object:IsA("TextLabel") or object:IsA("TextButton") then
         object.TextColor3 = Color3.new(1, 1, 1)
     end
-    local gradient = make("UIGradient", { Color = gradientSequence(palette, os.clock()), Rotation = 0 }, object)
-    liveGradients[gradient] = palette
+    local gradient = make("UIGradient", {
+        Color = colorSequence(palette), Rotation = 0,
+        Offset = Vector2.new(0, 0),
+    }, object)
+    local tween = TweenService:Create(gradient, TweenInfo.new(2.6, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false), {
+        Offset = Vector2.new(1, 0),
+    })
+    tween:Play()
+    liveGradients[gradient] = tween
+end
+
+local function clearGradients()
+    for gradient, tween in pairs(liveGradients) do
+        pcall(function() tween:Cancel() end)
+        if gradient then pcall(function() gradient:Destroy() end) end
+    end
+    liveGradients = {}
 end
 
 --==============================================================================
 -- CARD RENDERER
 --==============================================================================
 local function clearList()
+    clearGradients()
     for _, child in ipairs(list:GetChildren()) do
-        if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then child:Destroy() end
-    end
-    table.clear(liveGradients)
-end
-
-local function raritySpec(entry)
-    local byName = RARITY_BY_NAME[tostring(entry.rarity or ""):lower()]
-    if byName then return byName end
-    local byRank = RARITY_BY_RANK[tonumber(entry.rank) or 0]
-    if byRank then return byRank end
-    -- Unknown/renamed rarity: keep the egg visible (rank = the configured floor)
-    -- instead of assigning rank 0, which the MIN_RANK filter would hide.
-    -- NOTE: `tonumber(rank) or CONFIG.MIN_RANK` is not enough — a literal 0 is
-    -- truthy in Lua, so an unknown egg would keep rank 0 and vanish from the panel.
-    local rank = tonumber(entry.rank) or 0
-    if rank <= 0 then rank = CONFIG.MIN_RANK end
-    return { name = tostring(entry.rarity or "Unknown"), rank = rank, color = THEME.muted }
-end
-
-local function displayRank(entry)
-    local rank = tonumber(entry.rank) or 0
-    if rank > 0 then return rank end
-    return raritySpec(entry).rank
-end
-
--- The ONE place the min-rate / min-rarity filter lives. Scan loop, REFRESH and
--- the tab switch all go through it, so they can never disagree about what counts.
-local function filterEntries(entries)
-    local kept = {}
-    for _, entry in ipairs(entries or {}) do
-        local rate = tonumber(entry.rate) or 0
-        if rate >= STATE.minRate and displayRank(entry) >= STATE.minRank then
-            kept[#kept + 1] = entry
+        if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
+            child:Destroy()
         end
     end
-    table.sort(kept, function(a, b)
-        if (a.rate or 0) ~= (b.rate or 0) then return (a.rate or 0) > (b.rate or 0) end
-        return displayRank(a) > displayRank(b)
-    end)
-    return kept
 end
-
 
 local function weightText(entry)
     if validNumber(entry.weight) then return compact(entry.weight) .. " KG" end
     if validNumber(entry.scale) then return "×" .. compact(entry.scale) end
-    return "—"
+    return nil
 end
 
--- Card height adapts to the panel: 96 px (three rows of info) on a monitor,
--- ~52 px (name + income + badge) on a phone or a small Delta window. Without
--- this, two cards fill the list and the rest fall below the fold.
-local function cardHeight()
-    local height = panel.AbsoluteSize.Y
-    if not height or height <= 0 then return 96 end
-    if height >= 560 then return 96 end
-    if height >= 420 then return 76 end
-    return 52
+local function serverLine(entry)
+    if entry.isLocal or entry.jobId == nil or entry.jobId == game.JobId then
+        return "THIS SERVER", true
+    end
+    return "SERVER " .. shortId(entry.jobId), false
+end
+
+local pendingJoins = {}   -- button -> { until_ = number, restore = string }
+
+local function makeRow(parent, order, height)
+    return make("Frame", {
+        Name = "Row" .. order, Size = UDim2.new(1, 0, 0, height),
+        BackgroundTransparency = 1, LayoutOrder = order, ZIndex = 12,
+    }, parent)
 end
 
 local function makeCard(entry, index)
     local spec = raritySpec(entry)
-    local compact = cardHeight() < 96
-    local tall = cardHeight() >= 76
-    local card = make("Frame", {
-        Name = "Card" .. index, Size = UDim2.new(1, -4, 0, cardHeight()), BackgroundColor3 = THEME.glass,
-        BackgroundTransparency = 0.1, BorderSizePixel = 0, LayoutOrder = index, ZIndex = 5,
-    })
-    make("UICorner", { CornerRadius = UDim.new(0, 8) }, card)
-    make("UIGradient", { Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(168, 158, 200)) }, card)
-    make("UIStroke", { Color = Color3.fromRGB(110, 80, 185), Transparency = 0.3, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, card)
-
+    local rows = cardRows()
     local height = cardHeight()
-    local chipY = tall and 34 or (height - 22)
-    local chipX = compact and 44 or 10
-    local stripY = tall and 58 or 4
-    local areaY = tall and 78 or 30
+    local rank = displayRank(entry)
+    local canJoin = validJobId(entry.jobId)
+    local serverText, isHere = serverLine(entry)
 
-    -- rank + name
-    local rankLabel = label(card, "#" .. index, UDim2.fromOffset(6, 5), UDim2.fromOffset(30, 22), THEME.muted,
-        compact and 13 or 15)
-    rankLabel.Font = Enum.Font.GothamBlack
+    local card = make("Frame", {
+        Name = "Card" .. index, Size = UDim2.new(1, -4, 0, height),
+        BackgroundColor3 = THEME.glass, BackgroundTransparency = 0.06, BorderSizePixel = 0,
+        LayoutOrder = index, ZIndex = 11, ClipsDescendants = true,
+    })
+    corner(10, card)
+    stroke(card, isHere and THEME.line or THEME.accent, 1, isHere and 0.55 or 0.42)
+    -- rarity tint on the left edge
+    local tint = make("Frame", {
+        Name = "Tint", Size = UDim2.new(0, 3, 1, -12), Position = UDim2.fromOffset(0, 6),
+        BackgroundColor3 = spec.color, BackgroundTransparency = 0.15, BorderSizePixel = 0, ZIndex = 12,
+    }, card)
+    corner(2, tint)
 
-    local nameX = compact and 34 or 48
-    local nameLabel = label(card, tostring(entry.name), UDim2.fromOffset(nameX, 4),
-        UDim2.new(1, -(nameX + (tall and 150 or 108)), 0, 24), spec.color, tall and 17 or 15)
+    local bodyWidth = 1
+    local body = make("Frame", {
+        Name = "Body", Position = UDim2.fromOffset(9, 5),
+        Size = UDim2.new(1, -(canJoin and 96 or 18), 1, -10),
+        BackgroundTransparency = 1, ZIndex = 12,
+    }, card)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder,
+        HorizontalAlignment = Enum.HorizontalAlignment.Left,
+    }, body)
+
+    -- row 1: name + rarity chip
+    local row1 = makeRow(body, 1, 22)
+    local nameLabel = label(row1, tostring(entry.name), UDim2.new(), UDim2.new(1, -74, 0, 22), spec.color, rows >= 4 and 15 or 13)
     nameLabel.Font = Enum.Font.GothamBlack
-    make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1, Transparency = 0.5 }, nameLabel)
-
-    -- rarity chip
-    local chipWidth = compact and 74 or 86
+    if rank >= 8 then
+        local gradient = make("UIGradient", { Color = colorSequence({ spec.color, THEME.text, spec.color }), Rotation = 0 }, nameLabel)
+        local tween = TweenService:Create(gradient, TweenInfo.new(3.4, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false), {
+            Offset = Vector2.new(1, 0),
+        })
+        tween:Play()
+        liveGradients[gradient] = tween
+    end
     local chip = make("TextLabel", {
-        Text = tostring(entry.rarity):upper(), Position = UDim2.fromOffset(chipX, chipY),
-        Size = UDim2.fromOffset(chipWidth, 18),
-        BackgroundColor3 = spec.color, BackgroundTransparency = 0.82, BorderSizePixel = 0,
-        Font = Enum.Font.GothamBold, TextSize = compact and 9 or 10, TextColor3 = spec.color, ZIndex = 6,
-    }, card)
-    make("UICorner", { CornerRadius = UDim.new(0, 4) }, chip)
-    make("UIStroke", { Color = spec.color, Thickness = 1, Transparency = 0.55 }, chip)
+        Name = "Rarity",
+        Text = tostring(entry.rarity):upper(), Position = UDim2.new(1, -70, 0, 2),
+        Size = UDim2.fromOffset(70, 17), BackgroundColor3 = spec.color, BackgroundTransparency = 0.84,
+        BorderSizePixel = 0, Font = Enum.Font.GothamBold, TextSize = 9, TextColor3 = spec.color,
+        TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 13,
+    }, row1)
+    corner(4, chip)
+    stroke(chip, spec.color, 1, 0.5)
 
-    -- income (+ weight when the card has room)
-    local incomeY = tall and 34 or (height - 24)
-    local income = label(card, money(entry.rate), UDim2.fromOffset(chipX + chipWidth + 6, incomeY),
-        UDim2.fromOffset(tall and 120 or 110, 20), THEME.green, compact and 14 or 15)
+    -- row 2: income + weight
+    local row2 = makeRow(body, 2, 20)
+    local income = label(row2, money(entry.rate), UDim2.new(), UDim2.fromOffset(140, 20), THEME.green, rows >= 4 and 15 or 13)
     income.Font = Enum.Font.GothamBlack
-    if tall then
-        local weight = label(card, weightText(entry), UDim2.fromOffset(224, 34), UDim2.new(1, -320, 0, 20), THEME.muted, 12)
-        weight.TextXAlignment = Enum.TextXAlignment.Right
+    income.Name = "Income"
+    local weight = weightText(entry)
+    if weight then
+        local weightLabel = make("TextLabel", {
+            Name = "Weight", Text = weight, Position = UDim2.new(1, -110, 0, 0), Size = UDim2.fromOffset(110, 20),
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = THEME.muted,
+            TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 12,
+        }, row2)
+        weightLabel.Name = "Weight"
     end
 
-    -- mutations
-    local mutations = entry.mutations or {}
-    local strip = make("Frame", {
-        Name = "Mutations", Position = UDim2.fromOffset(nameX, stripY),
-        Size = UDim2.new(1, -(nameX + (tall and 110 or 108)), 0, 18), BackgroundTransparency = 1, ZIndex = 6,
-    }, card)
-    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, strip)
-    if #mutations == 0 then
-        if tall then
-            local none = label(strip, "no mutation", UDim2.new(), UDim2.fromOffset(90, 18), THEME.muted, 10)
-            none.Font = Enum.Font.Gotham
-            none.LayoutOrder = 1
+    -- row 3: mutations (only when the card is tall enough)
+    if rows >= 3 then
+        local row3 = makeRow(body, 3, 18)
+        local mutations = entry.mutations or {}
+        if #mutations == 0 then
+            local none = make("TextLabel", {
+                Name = "MutNone", Text = "no mutation", Size = UDim2.fromOffset(110, 18), BackgroundTransparency = 1,
+                Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = THEME.muted, ZIndex = 12,
+            }, row3)
+            none.TextXAlignment = Enum.TextXAlignment.Left
+        else
+            local flow = make("Frame", {
+                Name = "Mutations", Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, ZIndex = 12,
+            }, row3)
+            make("UIListLayout", {
+                FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5),
+                SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center,
+            }, flow)
+            for mutationIndex, mutation in ipairs(mutations) do
+                local word = make("TextLabel", {
+                    Name = "Mut" .. mutationIndex, Text = tostring(mutation),
+                    Size = UDim2.fromOffset(math.min(#tostring(mutation) * 7 + 10, 120), 18),
+                    BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, TextSize = 10,
+                    TextColor3 = THEME.text, TextTruncate = Enum.TextTruncate.AtEnd,
+                    LayoutOrder = mutationIndex, ZIndex = 13,
+                }, flow)
+                paintMutation(word, mutation)
+            end
         end
+    end
+
+    -- row 4: server / area
+    if rows >= 4 then
+        local row4 = makeRow(body, 4, 16)
+        local areaText = entry.area and ("area " .. tostring(entry.area)) or "area unknown"
+        local areaLabel = make("TextLabel", {
+            Name = "Area", Text = areaText, Size = UDim2.new(0.55, 0, 0, 16), BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = THEME.muted,
+            TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 12,
+        }, row4)
+        local serverLabel = make("TextLabel", {
+            Name = "Server", Text = serverText, Position = UDim2.new(0.55, 0, 0, 0), Size = UDim2.new(0.45, 0, 0, 16),
+            BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 9,
+            TextColor3 = isHere and THEME.muted or THEME.cyan,
+            TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 12,
+        }, row4)
+    end
+
+    -- join / here button (absolutely positioned so the row layout stays clean)
+    local joinButton = button(card, {
+        Name = "JoinStatus", Text = isHere and "HERE" or "JOIN",
+        Position = UDim2.new(1, -84, 0, math.floor((height - 30) / 2)),
+        Size = UDim2.fromOffset(74, 30), TextSize = 10, CornerRadius = 8, ZIndex = 14,
+    }, canJoin)
+    if not canJoin then
+        joinButton.Text = isHere and "HERE" or "NO ID"
+        joinButton.BackgroundColor3 = THEME.glassHigh
+        joinButton.TextColor3 = THEME.muted
     else
-        for index_, mutation in ipairs(mutations) do
-            local word = label(strip, tostring(mutation), UDim2.new(),
-                UDim2.fromOffset(#mutation * (compact and 7 or 8) + 10, 18), THEME.text, compact and 10 or 11)
-            word.Font = Enum.Font.GothamBlack
-            word.LayoutOrder = index_
-            paintMutation(word, mutation)
+        joinButton.BackgroundColor3 = Color3.fromRGB(38, 158, 92)
+        joinButton.TextColor3 = Color3.new(1, 1, 1)
+    end
+
+    joinButton.MouseButton1Click:Connect(function()
+        if isHere then
+            notify("you are already in this server", 3)
+            return
         end
-    end
-
-    -- area line (only when the card has a third row)
-    if tall and entry.area then
-        local areaLabel = label(card, "area " .. tostring(entry.area), UDim2.fromOffset(10, areaY),
-            UDim2.new(1, -120, 0, 14), THEME.muted, 10)
-        areaLabel.Font = Enum.Font.Gotham
-    end
-
-    -- join / status button
-    local joinable = entry.jobId ~= nil and entry.jobId ~= game.JobId
-    local buttonWidth = compact and 62 or 86
-    local buttonHeight = compact and 26 or 30
-    local button = styleButton(make("TextButton", {
-        Name = "JoinStatus", Text = joinable and "JOIN" or "HERE",
-        Position = UDim2.new(1, -(buttonWidth + 8), 0, math.floor((height - buttonHeight) / 2)),
-        Size = UDim2.fromOffset(buttonWidth, buttonHeight), ZIndex = 7,
-    }, card), joinable)
-    button.TextSize = compact and 10 or 12
-    button.BackgroundColor3 = joinable and Color3.fromRGB(40, 160, 85) or Color3.fromRGB(86, 90, 100)
-    button.MouseButton1Click:Connect(function()
-        if not joinable then return end
-        notify("claiming " .. tostring(entry.name) .. "…", 8)
-        task.spawn(function()
-            local ok, message = claimAndJoin(entry)
-            notify((ok and "auto join: " or "join blocked: ") .. tostring(message), 8)
-            if ok then STATE.reportStatus = "teleporting" end
-        end)
+        if not canJoin then
+            notify("this report has no usable JobId — cannot join", 5)
+            return
+        end
+        local pending = pendingJoins[joinButton]
+        if pending and os.clock() < pending.until_ then
+            pendingJoins[joinButton] = nil
+            joinButton.Text = "JOIN"
+            requestJoin(entry)
+            return
+        end
+        if CONFIG.AUTO_JOIN then
+            requestJoin(entry)
+            return
+        end
+        pendingJoins[joinButton] = { until_ = os.clock() + 5, }
+        joinButton.Text = "SURE?"
+        joinButton.BackgroundColor3 = ThemeAmberButton()
+        notify("tap JOIN again to teleport to " .. shortId(entry.jobId), 5)
     end)
-
-    -- rarity gradient on the name
-    if MUTATION_PALETTE.silver then
-        local gradient = make("UIGradient", { Enabled = false }, nameLabel)
-        if spec.rank >= 8 then
-            local palette = { spec.color, THEME.text, spec.color }
-            gradient.Enabled = true
-            gradient.Color = gradientSequence(palette, os.clock())
-            liveGradients[gradient] = palette
-        end
-    end
 
     return card
 end
 
+-- small helper kept out of the card body for readability
+function ThemeAmberButton()
+    return Color3.fromRGB(190, 132, 30)
+end
+
+--==============================================================================
+-- EMPTY STATES  (always accurate, never invented data)
+--==============================================================================
+local function emptyMessage()
+    if STATE.tab == "local" then
+        if STATE.scanned == 0 then
+            return "No field eggs detected in this server.\n\n"
+                .. (CAPS.moduleApi and "The game module is loaded but returned nothing — '
+                    .. 'eggs may not have spawned yet." or "Fallback attribute scan found nothing. '
+                    .. 'If eggs are visible in game, send me the workspace folder names.")
+        end
+        local matched = 0
+        for _, entry in ipairs(STATE.raw) do if passesFilter(entry) then matched = matched + 1 end end
+        if matched == 0 then
+            return string.format(
+                "%d egg(s) detected, 0 match your filters.\nFilter: %s+ rarity, %s minimum.\nLower the minimum income or tap RARITY.",
+                STATE.scanned, rarityName(STATE.minRank), moneyFilter(STATE.minRate)
+            )
+        end
+        return "No eggs to show."
+    end
+
+    if not CAPS.network then
+        return "No HTTP in this executor.\nALL SERVERS is disabled — the backend cannot be reached."
+    end
+    if STATE.feedBusy and not STATE.feedLoaded then
+        return "Contacting your backend…"
+    end
+    if STATE.feedError then
+        return "ALL SERVERS unavailable.\n" .. describeError(STATE.feedError)
+            .. "\n\nBackend: " .. rawEndpoint()
+    end
+    if not STATE.feedLoaded then
+        return "No backend data yet.\nTap REFRESH to load the feed."
+    end
+    if #STATE.feed == 0 then
+        return "Your backend has no reports right now.\n"
+            .. "Run M0x46 in other servers with BROADCAST on —\n"
+            .. "their eggs will appear here. Nothing is simulated."
+    end
+    local matched = STATE.feedMatched
+    if matched == 0 then
+        return string.format(
+            "%d egg(s) reported by other servers, 0 match your filters.\nFilter: %s+ rarity, %s minimum.",
+            #STATE.feed, rarityName(STATE.minRank), moneyFilter(STATE.minRate)
+        )
+    end
+    return "No eggs to show."
+end
+
+--==============================================================================
+-- RENDER
+--==============================================================================
 local function render()
     clearList()
-    local source = STATE.tab == "local" and STATE.entries or STATE.feed
-    local count = math.min(#source, CONFIG.CARD_LIMIT)
-    if count == 0 then
-        local empty = make("TextLabel", {
-            Text = STATE.tab == "local"
-                and string.format(
-                    "%d eggs visible, 0 match the filter.\nYour filter: %s+ rarity and %.2fB/s minimum.\nUse SETTINGS to lower the income floor.",
-                    STATE.rawCount or 0, rarityName(STATE.minRank), STATE.minRate / 1e9)
-                or "No reports yet.\nServers running your build will appear here.",
-            Size = UDim2.new(1, -8, 0, 68), BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
-            TextColor3 = THEME.muted, TextWrapped = true, LayoutOrder = 1, ZIndex = 5,
+    local shown, matched, total = visibleList()
+    if STATE.tab == "all" then STATE.feedMatched = matched end
+
+    if #shown == 0 then
+        local holder = make("Frame", {
+            Name = "EmptyState", Size = UDim2.new(1, -8, 0, 118), BackgroundColor3 = THEME.glass,
+            BackgroundTransparency = 0.35, BorderSizePixel = 0, LayoutOrder = 1, ZIndex = 11,
         }, list)
+        corner(10, holder)
+        stroke(holder, THEME.line, 1, 0.55)
+        local message = make("TextLabel", {
+            Name = "EmptyText", Text = emptyMessage(), Size = UDim2.new(1, -20, 1, -20),
+            Position = UDim2.fromOffset(10, 10), BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+            TextSize = 11, TextColor3 = THEME.muted, TextWrapped = true,
+            TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 12,
+        }, holder)
+        message.Name = "EmptyText"
         return
     end
-    for index = 1, count do
-        local card = makeCard(source[index], index)
+
+    for index = 1, #shown do
+        local card = makeCard(shown[index], index)
         card.Parent = list
+        -- subtle fade/slide in; tween on the engine side only
+        card.BackgroundTransparency = 1
+        TweenService:Create(card, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            BackgroundTransparency = 0.06,
+        }):Play()
     end
 end
+
+local function renderIfDirty()
+    if not panel.Visible then return end
+    if not STATE.dirty then return end
+    STATE.dirty = false
+    render()
+end
+
+--==============================================================================
+-- SCAN / FEED ACTIONS
+--==============================================================================
+local function ingestScan()
+    local ok, entries = pcall(scanOnce)
+    if not ok or type(entries) ~= "table" then
+        STATE.status = "scan error: " .. tostring(entries)
+        return false
+    end
+    -- keep the previous list if the game returned nothing this tick: a momentary
+    -- empty snapshot should not blank the panel and look like a bug
+    if #entries == 0 and #STATE.raw > 0 and (os.clock() - STATE.rawAt) < 3 then
+        return false
+    end
+    STATE.raw = entries
+    STATE.scanned = #entries
+    STATE.rawAt = os.clock()
+    local matched = 0
+    for _, entry in ipairs(entries) do if passesFilter(entry) then matched = matched + 1 end end
+    STATE.status = string.format("%d egg(s) • %d shown • %s", #entries, matched,
+        CAPS.moduleApi and "module api" or "attribute scan")
+    pcall(function()
+        gui:SetAttribute("M0x46Count", matched)
+        gui:SetAttribute("M0x46Raw", #entries)
+        gui:SetAttribute("M0x46Status", STATE.status)
+        gui:SetAttribute("M0x46Source", CAPS.moduleApi and "module" or "attributes")
+    end)
+    markDirty()
+    return true
+end
+
+local function ingestFeed()
+    if STATE.feedBusy then return false end
+    if not CAPS.network then
+        STATE.feedError = "HTTP unavailable"
+        STATE.feedLoaded = true
+        markDirty()
+        return false
+    end
+    STATE.feedBusy = true
+    local data, err = fetchFeed()
+    STATE.feedBusy = false
+    if not data or type(data.items) ~= "table" then
+        STATE.feedError = err or "invalid response"
+        STATE.feedLoaded = true
+        markDirty()
+        return false
+    end
+    local items, seen = {}, {}
+    for _, raw in ipairs(data.items) do
+        local entry = normalizeFeedItem(raw)
+        if entry then
+            local key = tostring(entry.uid) .. "|" .. tostring(entry.jobId)
+            local existing = seen[key]
+            if not existing then
+                seen[key] = entry
+                items[#items + 1] = entry
+            elseif (entry.rate or -1) > (existing.rate or -1) then
+                seen[key] = entry
+            end
+        end
+    end
+    local list = {}
+    for key, entry in pairs(seen) do list[#list + 1] = entry end
+    table.sort(list, sortByValue)
+    STATE.feed = list
+    STATE.feedTotal = tonumber(data.total) or #list
+    STATE.feedError = nil
+    STATE.feedLoaded = true
+    STATE.feedAt = os.clock()
+    STATE.feedMatched = 0
+    for _, entry in ipairs(list) do if passesFilter(entry) then STATE.feedMatched = STATE.feedMatched + 1 end end
+    markDirty()
+    return true
+end
+
+local feedInFlight = false
+local function refreshFeed()
+    if feedInFlight then return end
+    feedInFlight = true
+    task.spawn(function()
+        ingestFeed()
+        feedInFlight = false
+        if STATE.tab == "all" then renderIfDirty() end
+    end)
+end
+
+local function refreshLocal()
+    ingestScan()
+    renderIfDirty()
+end
+
+--==============================================================================
+-- JOIN
+--==============================================================================
+local function requestJoin(entry)
+    if not validJobId(entry.jobId) then
+        notify("no valid JobId for this egg", 5)
+        return false
+    end
+    local placeId = tonumber(entry.placeId) or game.PlaceId
+    notify("joining " .. shortId(entry.jobId) .. "…", 8)
+    -- advisory claim; failure must never block a join the user asked for
+    task.spawn(function()
+        pcall(function()
+            api("POST", "/v1/join", {
+                placeId = placeId, jobId = entry.jobId, uid = entry.uid, reporterId = reporterId,
+            })
+        end)
+    end)
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(placeId, entry.jobId, player)
+    end)
+    if not ok then
+        notify("teleport failed: " .. tostring(err), 8)
+        return false
+    end
+    return true
+end
+
+pcall(function()
+    TeleportService.TeleportInitFailed:Connect(function(_, _, message)
+        notify("teleport failed: " .. tostring(message), 8)
+    end)
+end)
 
 --==============================================================================
 -- UI BEHAVIOUR
@@ -1043,25 +1617,49 @@ end
 local function paintTabs()
     localTab.BackgroundColor3 = STATE.tab == "local" and THEME.accent or THEME.glass
     feedTab.BackgroundColor3 = STATE.tab == "all" and THEME.accent or THEME.glass
+    localTab.TextColor3 = THEME.text
+    feedTab.TextColor3 = THEME.text
+end
+
+local function paintBroadcast()
+    broadcastButton.Text = CONFIG.BROADCAST and "BROADCAST: ON" or "BROADCAST: OFF"
+    broadcastButton.TextColor3 = CONFIG.BROADCAST and THEME.text or THEME.red
+    broadcastToggle.Text = CONFIG.BROADCAST and "BROADCAST: ON" or "BROADCAST: OFF"
+    broadcastToggle.BackgroundColor3 = CONFIG.BROADCAST and Color3.fromRGB(34, 128, 74) or Color3.fromRGB(140, 44, 50)
+end
+
+local function paintAutoJoin()
+    autoJoinToggle.Text = CONFIG.AUTO_JOIN and "AUTO JOIN: ON" or "AUTO JOIN: OFF"
+    autoJoinToggle.BackgroundColor3 = CONFIG.AUTO_JOIN and Color3.fromRGB(34, 128, 74) or THEME.glass
+end
+
+local function paintFilter()
+    local spec = FILTERS[STATE.filterIndex]
+    filterButton.Text = "RARITY: " .. string.upper(spec.name)
+    local rarity = RARITY_BY_NAME[spec.name:lower()]
+    filterButton.TextColor3 = rarity and rarity.color or THEME.muted
+end
+
+local function applyFilters(reason)
+    -- raw data is untouched: filtering only re-renders
+    markDirty()
+    local shown, matched = visibleList()
+    if reason then
+        notify(string.format("%d shown (≥%s, %s+)", matched, moneyFilter(STATE.minRate), rarityName(STATE.minRank)), 3)
+    end
+    renderIfDirty()
 end
 
 local function setTab(key)
+    if STATE.tab == key then
+        if key == "all" then refreshFeed() end
+        return
+    end
     STATE.tab = key
     paintTabs()
+    markDirty()
     render()
-    if key == "all" then
-        task.spawn(function()
-            local data, err = fetchFeed(STATE.minRank, 0)
-            if data and type(data.items) == "table" then
-                STATE.feed = data.items
-                STATE.feedTotal = data.total or #data.items
-                STATE.status = string.format("%d servers reporting", STATE.feedTotal)
-            else
-                STATE.status = "feed: " .. tostring(err)
-            end
-            if STATE.tab == "all" then render() end
-        end)
-    end
+    if key == "all" then refreshFeed() end
 end
 
 localTab.MouseButton1Click:Connect(function() setTab("local") end)
@@ -1071,193 +1669,259 @@ filterButton.MouseButton1Click:Connect(function()
     STATE.filterIndex = STATE.filterIndex % #FILTERS + 1
     local spec = FILTERS[STATE.filterIndex]
     STATE.minRank = spec.rank
-    filterButton.Text = "MIN RARITY: " .. spec.name:upper()
-    local rarity = RARITY_BY_NAME[spec.name:lower()]
-    filterButton.TextColor3 = rarity and rarity.color or THEME.text
-    render()
+    paintFilter()
+    applyFilters(true)
 end)
 
 refreshButton.MouseButton1Click:Connect(function()
     notify("scanning…", 2)
-    local ok, entries = pcall(scanOnce)
-    if not ok or type(entries) ~= "table" then
-        notify("scan error: " .. tostring(entries), 6)
-        return
-    end
-    -- REFRESH used to assign the raw scan straight to STATE.entries, skipping the
-    -- min-income / min-rarity filter. The next scan tick (1 s later) applied the
-    -- filter, found nothing above the floor, and the list went blank: exactly the
-    -- "cards appear, then 'No matching eggs'" behaviour.
-    STATE.entries = filterEntries(entries)
-    STATE.rawCount = #entries
-    STATE.status = string.format("%d eggs • %s", #STATE.entries,
-        CAPS.moduleApi and "module api" or "attribute scan")
-    notify(string.format("%d eggs above %.2fB and %s+", #STATE.entries,
-        STATE.minRate / 1e9, rarityName(STATE.minRank)), 4)
-    if STATE.tab == "local" then render() end
+    refreshLocal()
+    if STATE.tab == "all" then refreshFeed() end
+    local shown, matched = visibleList()
+    notify(string.format("%d egg(s) match (≥%s, %s+)", matched, moneyFilter(STATE.minRate), rarityName(STATE.minRank)), 4)
+    local _ = shown
 end)
 
-local function paintBroadcast()
-    broadcastButton.Text = CONFIG.BROADCAST and "BROADCAST: ON" or "BROADCAST: OFF"
-    broadcastButton.TextColor3 = CONFIG.BROADCAST and THEME.text or THEME.red
-end
 broadcastButton.MouseButton1Click:Connect(function()
     CONFIG.BROADCAST = not CONFIG.BROADCAST
     paintBroadcast()
+    notify(CONFIG.BROADCAST and "broadcasting enabled" or "broadcasting paused")
 end)
-paintBroadcast()
 
 settingsButton.MouseButton1Click:Connect(function()
     overlay.Visible = not overlay.Visible
+    if overlay.Visible then paintOverlayInfo() end
 end)
 overlayClose.MouseButton1Click:Connect(function() overlay.Visible = false end)
 
-local function paintToggle(button, text, on)
-    button.Text = text
-    button.BackgroundColor3 = on and Color3.fromRGB(40, 135, 75) or Color3.fromRGB(155, 48, 52)
-end
-
-paintToggle(broadcastToggle, "BROADCAST: ON", CONFIG.BROADCAST)
-paintToggle(autoJoinToggle, "AUTO JOIN: OFF", CONFIG.AUTO_JOIN)
-
 broadcastToggle.MouseButton1Click:Connect(function()
     CONFIG.BROADCAST = not CONFIG.BROADCAST
-    paintToggle(broadcastToggle, CONFIG.BROADCAST and "BROADCAST: ON" or "BROADCAST: OFF", CONFIG.BROADCAST)
     paintBroadcast()
     notify(CONFIG.BROADCAST and "broadcasting enabled" or "broadcasting paused")
 end)
 
 autoJoinToggle.MouseButton1Click:Connect(function()
     CONFIG.AUTO_JOIN = not CONFIG.AUTO_JOIN
-    paintToggle(autoJoinToggle, CONFIG.AUTO_JOIN and "AUTO JOIN: ON" or "AUTO JOIN: OFF", CONFIG.AUTO_JOIN)
-    notify(CONFIG.AUTO_JOIN and "auto join enabled — JOIN buttons will teleport" or "auto join disabled")
+    paintAutoJoin()
+    notify(CONFIG.AUTO_JOIN and "JOIN teleports immediately" or "JOIN now asks SURE? first")
 end)
 
-rateBox.FocusLost:Connect(function()
-    local amount = tonumber((tostring(rateBox.Text):gsub("[^%d%.]", "")))
-    if amount and amount >= 0 and amount <= 50 then
-        if amount < 0.1 then amount = 0 end -- 0 = show everything
-        CONFIG.MIN_RATE = amount * 1e9
-        STATE.minRate = CONFIG.MIN_RATE
-        rateBox.Text = string.format("%gB", amount)
-        notify("minimum income set to " .. rateBox.Text)
+-- income box: parse "1B", "250M", "0", "off", "1.5b"
+local function parseIncome(text)
+    local clean = string.lower(tostring(text or "")):gsub("%s", "")
+    if clean == "" or clean == "off" or clean == "0" then return 0 end
+    local amount, suffix = clean:match("^([%d%.]+)([kmbtq]?)")
+    local value = tonumber(amount)
+    if not value then return nil end
+    local multiplier = ({ k = 1e3, m = 1e6, b = 1e9, t = 1e12, q = 1e15 })[suffix] or 1
+    return value * multiplier
+end
+
+local function applyIncomeBox(silent)
+    local value = parseIncome(rateBox.Text)
+    if not value then
+        rateBox.Text = moneyFilter(STATE.minRate)
+        notify("income must look like 1B, 250M or 0 (off)", 5)
+        return
+    end
+    STATE.minRate = clamp(value, 0, 1e13)
+    rateBox.Text = moneyFilter(STATE.minRate)
+    applyFilters(not silent)
+end
+
+rateBox.FocusLost:Connect(function() applyIncomeBox(false) end)
+rateBox:GetPropertyChangedSignal("Text"):Connect(function()
+    -- live update while typing, but only for a complete, valid number
+    if parseIncome(rateBox.Text) ~= nil then
+        STATE.minRate = clamp(parseIncome(rateBox.Text), 0, 1e13)
+        markDirty()
+        renderIfDirty()
+    end
+end)
+
+for _, preset in ipairs(presetButtons) do
+    preset.button.MouseButton1Click:Connect(function()
+        STATE.minRate = preset.value
+        rateBox.Text = moneyFilter(STATE.minRate)
+        applyFilters(true)
+    end)
+end
+
+--==============================================================================
+-- MINIMISE / REOPEN / CLOSE
+--==============================================================================
+local function fadePanel(target, visible)
+    if visible then
+        panel.Visible = true
+        panelScale.Scale = 0.96
+        TweenService:Create(panelScale, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = 1 }):Play()
         render()
     else
-        rateBox.Text = string.format("%gB", CONFIG.MIN_RATE / 1e9)
-        notify("enter 0 to 50 (B/s) — e.g. 0.25 for 250M/s")
+        local tween = TweenService:Create(panelScale, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.96 })
+        tween.Completed:Connect(function() panel.Visible = false; panelScale.Scale = 1 end)
+        tween:Play()
     end
-end)
-
-local function togglePanel()
-    panel.Visible = not panel.Visible
-    if panel.Visible then render() end
+    launcher.Visible = not visible
+    local _ = target
 end
-launcher.MouseButton1Click:Connect(togglePanel)
+
+local function openPanel()
+    if panel.Visible then return end
+    clampPanel()
+    fadePanel(nil, true)
+    paintTabs()
+end
+
+local function minimizePanel()
+    if not panel.Visible then return end
+    fadePanel(nil, false)
+end
+
+local function closeScript()
+    notify("M0x46 unloaded", 2)
+    pcall(function() gui:Destroy() end)
+end
+
+launcher.MouseButton1Click:Connect(function()
+    if panel.Visible then minimizePanel() else openPanel() end
+end)
+minimizeButton.MouseButton1Click:Connect(minimizePanel)
+closeButton.MouseButton1Click:Connect(closeScript)
+resetLabel:GetPropertyChangedSignal("Text"):Connect(function() end)
+
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
-    if input.KeyCode == CONFIG.HOTKEY then togglePanel() end
+    if input.KeyCode == CONFIG.HOTKEY then
+        if panel.Visible then minimizePanel() else openPanel() end
+    end
 end)
 
 --==============================================================================
--- LOOPS
+-- MAIN LOOP  (one coroutine for scan, broadcast, feed and UI text)
 --==============================================================================
-task.spawn(function()
-    while gui.Parent do
-        local ok, entries = pcall(scanOnce)
-        if ok and type(entries) == "table" then
-            local filtered = filterEntries(entries)
-            STATE.entries = filtered
-            STATE.rawCount = #entries
-            STATE.scanAge = os.clock()
-            STATE.status = string.format("%d eggs • %s", #filtered, CAPS.moduleApi and "module api" or "attribute scan")
-            pcall(function()
-                gui:SetAttribute("M0x46Count", #filtered)
-                gui:SetAttribute("M0x46Raw", #entries)
-                gui:SetAttribute("M0x46Status", STATE.status)
-                gui:SetAttribute("M0x46Source", CAPS.moduleApi and "module" or "attributes")
-            end)
-            if panel.Visible and STATE.tab == "local" then render() end
-        else
-            STATE.status = "scan error: " .. tostring(entries)
-        end
-        task.wait(CONFIG.SCAN_EVERY)
-    end
-end)
+local loop = {
+    nextScan = 0,
+    nextReport = 0,
+    nextFeed = 0,
+    lastBroadcast = nil,
+}
 
-task.spawn(function()
-    while gui.Parent do
-        task.wait(CONFIG.REPORT_EVERY)
-        if CONFIG.BROADCAST and #STATE.entries > 0 then
-            local data, err = broadcast(STATE.entries)
-            if data then
-                STATE.reportStatus = string.format("broadcast %d eggs", data.accepted or 0)
-                pcall(function() gui:SetAttribute("M0x46Reported", tonumber(data.accepted) or 0) end)
-            elseif err and err ~= "busy" then
-                STATE.reportStatus = "broadcast: " .. tostring(err)
-            end
-        end
-    end
-end)
+local function updateStatusLine()
+    local line = STATE.status
+    if STATE.notice and os.clock() < STATE.noticeUntil then line = STATE.notice end
+    statusText.Text = tostring(STATE.reportStatus) .. "  ·  " .. tostring(line)
+    statusText.TextColor3 = STATE.feedError and THEME.amber or THEME.cyan
+end
 
-task.spawn(function()
-    while gui.Parent do
-        task.wait(CONFIG.FEED_EVERY)
-        if STATE.tab == "all" then
-            local data, err = fetchFeed(STATE.minRank, 0)
-            if data and type(data.items) == "table" then
-                STATE.feed = data.items
-                STATE.feedTotal = data.total or #data.items
-                if panel.Visible then render() end
-            elseif err and err ~= "busy" then
-                STATE.status = "feed: " .. tostring(err)
-            end
+local function updateReset()
+    local cycle = cycleInfo()
+    if cycle and validNumber(cycle.remaining) then
+        local seconds = math.max(0, math.ceil(cycle.remaining))
+        resetLabel.Text = cycle.running == false and "PAUSED"
+            or string.format("%02d:%02d", math.floor(seconds / 60), seconds % 60)
+        resetLabel.TextColor3 = seconds <= 60 and THEME.red or seconds <= 150 and THEME.amber or THEME.muted
+    else
+        resetLabel.Text = "--:--"
+        resetLabel.TextColor3 = THEME.muted
+    end
+end
+
+local function expirePendingJoins()
+    for button, pending in pairs(pendingJoins) do
+        if not button.Parent then
+            pendingJoins[button] = nil
+        elseif os.clock() >= pending.until_ then
+            button.Text = "JOIN"
+            button.BackgroundColor3 = Color3.fromRGB(38, 158, 92)
+            pendingJoins[button] = nil
         end
     end
-end)
+end
 
 task.spawn(function()
+    -- first data pull immediately, then follow the schedule
+    ingestScan()
+    loop.nextScan = os.clock() + CONFIG.SCAN_EVERY
+    loop.nextFeed = os.clock()
+
     while gui.Parent do
-        local line = STATE.status
-        if STATE.notice and os.clock() < STATE.noticeUntil then line = STATE.notice end
-        statusText.Text = STATE.reportStatus .. "  ·  " .. line
-        local cycle = cycleInfo()
-        if cycle and validNumber(cycle.remaining) then
-            local seconds = math.max(0, math.ceil(cycle.remaining))
-            resetLabel.Text = cycle.running == false and "RESET PAUSED"
-                or string.format("RESET %02d:%02d", math.floor(seconds / 60), seconds % 60)
-            resetLabel.TextColor3 = seconds <= 60 and THEME.red or seconds <= 150 and Color3.fromRGB(255, 215, 65) or THEME.muted
-        else
-            resetLabel.Text = "RESET --:--"
-            resetLabel.TextColor3 = THEME.muted
+        local now = os.clock()
+        local interval = panel.Visible and CONFIG.SCAN_EVERY or CONFIG.HIDDEN_SCAN_EVERY
+
+        if now >= loop.nextScan then
+            ingestScan()
+            loop.nextScan = now + interval
         end
-        for gradient, palette in pairs(liveGradients) do
-            if gradient.Parent then
-                gradient.Color = gradientSequence(palette, os.clock())
+
+        -- broadcast: only when something changed, or every 15 s as a keep-alive
+        if CONFIG.BROADCAST and #STATE.raw > 0 and now >= loop.nextReport then
+            local signature = tostring(#STATE.raw) .. ":" .. tostring(STATE.raw[1] and STATE.raw[1].uid)
+            if signature ~= loop.lastBroadcast or now >= loop.nextReport + 10 then
+                loop.lastBroadcast = signature
+                loop.nextReport = now + CONFIG.REPORT_EVERY
+                local data, err = broadcast(STATE.raw)
+                if data then
+                    STATE.reportStatus = string.format("shared %d", tonumber(data.accepted) or 0)
+                    pcall(function() gui:SetAttribute("M0x46Reported", tonumber(data.accepted) or 0) end)
+                elseif err and err ~= "busy" then
+                    STATE.reportStatus = describeError(err)
+                end
             else
-                liveGradients[gradient] = nil
+                loop.nextReport = now + CONFIG.REPORT_EVERY
             end
         end
-        task.wait(0.25)
+
+        -- feed: only while ALL SERVERS is actually on screen
+        if STATE.tab == "all" and panel.Visible and now >= loop.nextFeed then
+            loop.nextFeed = now + CONFIG.FEED_EVERY
+            if not feedInFlight then
+                feedInFlight = true
+                task.spawn(function()
+                    ingestFeed()
+                    feedInFlight = false
+                end)
+            end
+        end
+
+        expirePendingJoins()
+        updateStatusLine()
+        if panel.Visible then
+            updateReset()
+            renderIfDirty()
+        end
+
+        task.wait(CONFIG.UI_TICK)
     end
 end)
 
 gui.Destroying:Connect(function()
     for _, tween in ipairs(starTweens) do pcall(function() tween:Cancel() end) end
-    table.clear(liveGradients)
+    clearGradients()
 end)
 
-render()
+--==============================================================================
+-- BOOT
+--==============================================================================
+clampPanel()
+clampLauncher()
 paintTabs()
-log("M0x46 Finder loaded — hotkey", CONFIG.HOTKEY.Name, "| source:", CAPS.moduleApi and "module" or "attributes")
+paintBroadcast()
+paintAutoJoin()
+paintFilter()
+paintOverlayInfo()
+render()
+panelScale.Scale = 1
+log("M0x46 Finder v2.0 loaded — hotkey", CONFIG.HOTKEY.Name,
+    "| source:", CAPS.moduleApi and "module" or "attributes")
 
--- Fail loudly instead of showing "HTTP 0" forever.
-if CONFIG.BROADCAST then
-    if not CAPS.network then
-        log("WARNING: this executor exposes no HTTP function — the feed is OFF")
-    elseif CONFIG.ENDPOINT:find("127%.0%.0%.1") or CONFIG.ENDPOINT:find("localhost") then
-        log("WARNING: ENDPOINT is still the local default (" .. CONFIG.ENDPOINT ..
-            ") — the game cannot reach your PC. Set CONFIG.ENDPOINT to your public backend URL.")
+-- loud, actionable warnings instead of silent zeroes
+if not CAPS.network then
+    log("WARNING: this executor exposes no HTTP function — ALL SERVERS is disabled")
+else
+    local endpoint = rawEndpoint()
+    if endpoint:find("127%.0%.0%.1") or endpoint:find("localhost") then
+        log("WARNING: ENDPOINT is the local default (" .. endpoint .. ") — the game cannot reach your PC.")
     elseif CONFIG.ROOM_KEY == "changeme" then
-        log("WARNING: ROOM_KEY is still 'changeme' — set it to the same value you started the server with")
+        log("WARNING: ROOM_KEY is still 'changeme' — set it to the value you started the server with")
     end
 end
