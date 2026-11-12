@@ -47,7 +47,7 @@
 -- CONFIG  (edit this block only)
 --==============================================================================
 local CONFIG = {
-    ENDPOINT = "https://m0x46-iqjlgk34.back4.app",   -- your backend, no trailing slash
+    ENDPOINT = "https://m0x46-nvkkmo62.back4.app",   -- your backend, no trailing slash
     ROOM_KEY = "jeDFerngBqaQhS_W%b{ExA6-GI,W&:JI",                -- must equal ROOM_KEY on the server
 
     HOTKEY = Enum.KeyCode.RightControl,
